@@ -15,13 +15,16 @@ ccflags-y += -I$(src)/deps/KallRecon/lib
 KALLRECON_REV := 8d647f07ac66d380cdaa1cff8c168a8ab24c1c3b
 KALLRECON_URL := https://github.com/Dere3046/KallRecon.git
 
-ifeq ($(KDIR),)
-$(error KDIR must be set, e.g. "make KDIR=/path/to/kernel-source")
-endif
-PWD := $(shell pwd)
+KDIR := $(KDIR)
+MDIR := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+ODIR := $(MDIR)/out/$(VER)
+
+$(info -- KDIR: $(KDIR))
+$(info -- MDIR: $(MDIR))
+$(info -- ODIR: $(ODIR))
 
 all: deps
-	make -C $(KDIR) M=$(PWD) modules
+	make -C $(KDIR) M=$(ODIR) src=$(MDIR) modules
 
 deps:
 	@if [ ! -f deps/KallRecon/lib/core.c ]; then \
@@ -30,4 +33,4 @@ deps:
 	fi
 
 clean:
-	make -C $(KDIR) M=$(PWD) clean
+	make -C $(KDIR) M=$(ODIR) src=$(MDIR) clean
