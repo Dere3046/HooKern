@@ -14,12 +14,6 @@
 #include "hk_kprobe.h"
 #include "hk_kretprobe.h"
 
-#ifdef HK_SELF_TEST
-#include "../test/self_test.h"
-static int self_test;
-module_param(self_test, int, 0);
-#endif
-
 extern unsigned long (*kallrecon_klp)(const char *name);
 extern void find_kallsyms_base(void);
 
@@ -88,16 +82,6 @@ static int __init lkmhook_init(void)
 		pr_warn("[lkmhook] kallsyms recovery failed\n");
 		return -ENODATA;
 	}
-
-#ifdef HK_SELF_TEST
-	if (self_test) {
-		int fails = hk_self_test();
-
-		pr_info("[lkmhook] self test %s (%d fails)\n",
-			fails ? "FAILED" : "ALL PASS", fails);
-		return fails ? -EINVAL : 0;
-	}
-#endif
 
 	ret = hk_init(&cfg);
 	if (ret)
