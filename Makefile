@@ -12,7 +12,6 @@ ccflags-y += -Wno-strict-prototypes
 ccflags-y += -I$(src)/lib
 ccflags-y += -I$(src)/deps/KallRecon/lib
 
-KALLRECON_REV := 8d647f07ac66d380cdaa1cff8c168a8ab24c1c3b
 KALLRECON_URL := https://github.com/Dere3046/KallRecon.git
 
 KDIR := $(KDIR)
@@ -28,8 +27,7 @@ all: deps
 
 deps:
 	@if [ ! -f deps/KallRecon/lib/core.c ]; then \
-		git clone --no-checkout $(KALLRECON_URL) deps/KallRecon; \
-		git -C deps/KallRecon checkout $(KALLRECON_REV); \
+		git clone --depth 1 $(KALLRECON_URL) deps/KallRecon; \
 	fi
 
 clean:
