@@ -31,4 +31,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: lkmhook-${{ matrix.kmi }}
-          path: lkmhook.ko
+          path: out/lkmhook.ko
