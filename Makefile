@@ -12,11 +12,6 @@ ccflags-y += -Wno-strict-prototypes
 ccflags-y += -I$(src)/lib
 ccflags-y += -I$(src)/deps/KallRecon/lib
 
-ifeq ($(TEST),1)
-lkmhook-y += test/self_test.o
-ccflags-y += -DHK_SELF_TEST
-endif
-
 KALLRECON_REV := 8d647f07ac66d380cdaa1cff8c168a8ab24c1c3b
 KALLRECON_URL := https://github.com/Dere3046/KallRecon.git
 
@@ -25,14 +20,14 @@ $(error KDIR must be set, e.g. "make KDIR=/path/to/kernel-source")
 endif
 PWD := $(shell pwd)
 
+all: deps
+	make -C $(KDIR) M=$(PWD) modules
+
 deps:
 	@if [ ! -f deps/KallRecon/lib/core.c ]; then \
 		git clone --no-checkout $(KALLRECON_URL) deps/KallRecon; \
 		git -C deps/KallRecon checkout $(KALLRECON_REV); \
 	fi
-
-all: deps
-	make -C $(KDIR) M=$(PWD) modules
 
 clean:
 	make -C $(KDIR) M=$(PWD) clean
