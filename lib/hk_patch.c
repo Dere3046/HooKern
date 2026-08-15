@@ -147,6 +147,57 @@ struct patch_info {
 	atomic_t cpu_count;
 };
 
+bool hk_patch_guarded(void *addr)
+{
+	unsigned long v = (unsigned long)addr;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+	if (!ker_addr_ok(v))
+		return false;
+	if (!g_init_mm) {
+		g_init_mm = (struct mm_struct *)hk_resolve("init_mm");
+		if (!g_init_mm)
+			return false;
+	}
+
+	pgd = pgd_offset(g_init_mm, v);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return false;
+
+	p4d = p4d_offset(pgd, v);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return false;
+
+	pud = pud_offset(p4d, v);
+	if (pud_none(*pud))
+		return false;
+#if defined(pud_leaf)
+	if (pud_leaf(*pud))
+		return !!(pud_val(*pud) & PTE_GP);
+#endif
+	if (pud_bad(*pud))
+		return false;
+
+	pmd = pmd_offset(pud, v);
+	if (pmd_none(*pmd))
+		return false;
+#if defined(pmd_leaf)
+	if (pmd_leaf(*pmd))
+		return !!(pmd_val(*pmd) & PTE_GP);
+#endif
+	if (pmd_bad(*pmd))
+		return false;
+
+	pte = pte_offset_kernel(pmd, v);
+	if (!pte || !pte_present(*pte))
+		return false;
+	return !!(pte_val(*pte) & PTE_GP);
+}
+
 static int __nocfi patch_text_cb(void *arg)
 {
 	struct patch_info *p = arg;
