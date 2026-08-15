@@ -12,8 +12,6 @@ ccflags-y += -Wno-strict-prototypes
 ccflags-y += -I$(src)/lib
 ccflags-y += -I$(src)/deps/KallRecon/lib
 
-KALLRECON_URL := https://github.com/Dere3046/KallRecon.git
-
 KDIR := $(KDIR)
 MDIR := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 ODIR := $(MDIR)/out/$(VER)
@@ -22,13 +20,8 @@ $(info -- KDIR: $(KDIR))
 $(info -- MDIR: $(MDIR))
 $(info -- ODIR: $(ODIR))
 
-all: deps
+all:
 	make -C $(KDIR) M=$(ODIR) src=$(MDIR) modules
-
-deps:
-	@if [ ! -f deps/KallRecon/lib/core.c ]; then \
-		git clone --depth 1 $(KALLRECON_URL) deps/KallRecon; \
-	fi
 
 clean:
 	make -C $(KDIR) M=$(ODIR) src=$(MDIR) clean
