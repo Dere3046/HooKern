@@ -13,7 +13,8 @@
 #include "hk_patch.h"
 #include "hk_inline.h"
 
-#define HK_TRAMP_HEAD (4 + HK_INLINE_WINDOW_MAX + HK_INLINE_WINDOW_MIN)
+#define HK_TRAMP_HEAD (8 + HK_INLINE_WINDOW_MAX + HK_INLINE_WINDOW_MIN)
+#define HK_THUNK_SIZE 8
 
 static __nocfi u32 hk_get_insn(const u8 *p)
 {
@@ -72,26 +73,42 @@ static __nocfi u32 hk_enc_br(u32 rn)
 	return 0xD61F0000 | (rn << 5);
 }
 
+static __nocfi u32 hk_enc_ret(u32 rn)
+{
+	return 0xD65F0000 | (rn << 5);
+}
+
+static __nocfi u32 hk_enc_b(unsigned long pc, unsigned long target)
+{
+	long disp = (long)target - (long)pc;
+
+	if (disp < -(1L << 27) || disp >= (1L << 27))
+		return 0;
+	return 0x14000000 | (((unsigned long)disp >> 2) & 0x03FFFFFF);
+}
+
 static __nocfi void hk_build_jump(u32 *out, unsigned long target)
 {
 	out[0] = hk_enc_movz(16, target & 0xFFFF, 0);
 	out[1] = hk_enc_movk(16, (target >> 16) & 0xFFFF, 1);
 	out[2] = hk_enc_movk(16, (target >> 32) & 0xFFFF, 2);
 	out[3] = hk_enc_movk(16, (target >> 48) & 0xFFFF, 3);
-	out[4] = hk_enc_br(16);
+	out[4] = hk_enc_ret(16);
 }
 
-int hk_inline_hook(struct hk_inline *h, const char *sym, void *stub,
-		   unsigned long wrapper)
+int hk_inline_hook(struct hk_inline *h, const char *sym,
+		   const char *stub_sym, const char *wrapper_sym)
 {
 	u8 buf[HK_INLINE_WINDOW_MAX];
 	u32 tramp[HK_TRAMP_HEAD / 4];
 	u32 detour[HK_INLINE_WINDOW_MIN / 4];
 	unsigned long addr;
+	unsigned long stub;
+	unsigned long wrapper;
 	u32 window = 0, w, i;
 	int ret;
 
-	if (!h || !sym || !stub || !wrapper)
+	if (!h || !sym || !stub_sym || !wrapper_sym)
 		return -EINVAL;
 	memset(h, 0, sizeof(*h));
 
@@ -100,20 +117,19 @@ int hk_inline_hook(struct hk_inline *h, const char *sym, void *stub,
 		pr_warn("[lkmhook] inline resolve %s failed\n", sym);
 		return -ENODATA;
 	}
+	stub = hk_resolve(stub_sym);
+	if (!stub) {
+		pr_warn("[lkmhook] inline resolve %s failed\n", stub_sym);
+		return -ENODATA;
+	}
+	wrapper = hk_resolve(wrapper_sym);
+	if (!wrapper) {
+		pr_warn("[lkmhook] inline resolve %s failed\n", wrapper_sym);
+		return -ENODATA;
+	}
 	if (copy_from_kernel_nofault(buf, (void *)addr, sizeof(buf))) {
 		pr_warn("[lkmhook] inline read %s failed\n", sym);
 		return -EFAULT;
-	}
-
-	if (hk_patch_guarded((void *)addr) || hk_patch_guarded(stub)) {
-		/*
-		 * guarded pages (BTI): the trampoline jump back targets
-		 * plain function body without a bti landing pad, indirect
-		 * branches to it fault. refuse instead of crashing.
-		 */
-		pr_warn("[lkmhook] inline %s on BTI kernel unsupported\n",
-			sym);
-		return -EOPNOTSUPP;
 	}
 
 	for (w = HK_INLINE_WINDOW_MIN; w <= HK_INLINE_WINDOW_MAX; w += 4) {
@@ -135,12 +151,25 @@ int hk_inline_hook(struct hk_inline *h, const char *sym, void *stub,
 		return -ENOEXEC;
 	}
 
-	/* trampoline: bti + window + jump(func+window) */
-	tramp[0] = 0xD503245F;
+	/* stub layout:
+	 * 0:      bti jc          (ret from detour lands here)
+	 * 4:      b wrapper       (direct branch, not BTI checked)
+	 * 8:      bti jc          (trampoline entry, wrapper bl's here)
+	 * 12:     saved window
+	 * 12+w:   movz/movk/ret   jump back to func+window
+	 */
+	tramp[0] = 0xD50324DF;
+	tramp[1] = hk_enc_b(stub + 4, wrapper);
+	if (!tramp[1]) {
+		pr_warn("[lkmhook] inline wrapper too far from stub\n");
+		return -ERANGE;
+	}
+	tramp[2] = 0xD50324DF;
 	for (i = 0; i < window / 4; i++)
-		tramp[1 + i] = hk_get_insn(buf + i * 4);
-	hk_build_jump(tramp + 1 + window / 4, addr + window);
-	ret = hk_patch_text(stub, tramp, 4 + window + HK_INLINE_WINDOW_MIN,
+		tramp[3 + i] = hk_get_insn(buf + i * 4);
+	hk_build_jump(tramp + 3 + window / 4, addr + window);
+	ret = hk_patch_text((void *)stub, tramp,
+			    12 + window + HK_INLINE_WINDOW_MIN,
 			    HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE);
 	if (ret) {
 		pr_warn("[lkmhook] inline tramp %s failed %d\n", sym, ret);
@@ -148,7 +177,7 @@ int hk_inline_hook(struct hk_inline *h, const char *sym, void *stub,
 	}
 
 	memcpy(h->saved, buf, HK_INLINE_WINDOW_MIN);
-	hk_build_jump(detour, wrapper);
+	hk_build_jump(detour, stub);
 	ret = hk_patch_text((void *)addr, detour, HK_INLINE_WINDOW_MIN,
 			    HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE);
 	if (ret) {
@@ -159,9 +188,9 @@ int hk_inline_hook(struct hk_inline *h, const char *sym, void *stub,
 	h->name = sym;
 	h->addr = addr;
 	h->window = window;
-	h->stub = stub;
+	h->stub = (void *)stub;
 	pr_info("[lkmhook] inline %s @ 0x%lx window=%u tramp=%px\n",
-		sym, addr, window, stub);
+		sym, addr, window, (void *)stub);
 	return 0;
 }
 

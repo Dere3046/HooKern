@@ -19,8 +19,8 @@ struct hk_inline {
 	u8 saved[HK_INLINE_WINDOW_MIN];
 };
 
-int hk_inline_hook(struct hk_inline *h, const char *sym, void *stub,
-		   unsigned long wrapper);
+int hk_inline_hook(struct hk_inline *h, const char *sym,
+		   const char *stub_sym, const char *wrapper_sym);
 void hk_inline_unhook(struct hk_inline *h);
 
 #endif
