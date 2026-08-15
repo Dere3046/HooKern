@@ -13,5 +13,6 @@
 
 int hk_patch_text(void *dst, const void *src, size_t len, int flags);
 int hk_patch_write(void *dst, unsigned long val);
+bool hk_patch_guarded(void *addr);
 
 #endif
