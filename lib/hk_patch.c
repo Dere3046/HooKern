@@ -7,7 +7,6 @@
 #include <linux/mm.h>
 #include <linux/printk.h>
 #include <linux/spinlock.h>
-#include <linux/stop_machine.h>
 #include <asm/cacheflush.h>
 #include <asm/fixmap.h>
 #include <asm/pgtable.h>
@@ -21,79 +20,94 @@ typedef void (*fixmap_fn)(unsigned long idx, phys_addr_t phys,
 
 static DEFINE_SPINLOCK(patch_lock);
 
-static struct mm_struct *g_init_mm;
 static clean_inval_fn g_clean_inval;
 static fixmap_fn g_set_fixmap;
+static unsigned long g_kimage_voffset;
+static unsigned long g_text;
+static unsigned long g_end;
+static unsigned long (*g_vmalloc_to_pfn_fn)(const void *addr);
 
 static bool ker_addr_ok(unsigned long v)
 {
 	return v >= 0xffff000000000000UL;
 }
 
-static unsigned long virt_to_phys_walk(unsigned long addr)
+static bool kernel_image_addr(unsigned long addr)
 {
-	pgd_t *pgd;
-	p4d_t *p4d;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *pte;
-
-	if (!ker_addr_ok(addr))
-		return 0;
-	if (!g_init_mm) {
-		g_init_mm = (struct mm_struct *)hk_resolve("init_mm");
-		if (!g_init_mm) {
-			pr_warn("[lkmhook] init_mm not found\n");
-			return 0;
+	if (!g_text || !g_end) {
+		g_text = hk_resolve("_text");
+		g_end = hk_resolve("_end");
+		if (!g_text || !g_end || !ker_addr_ok(g_text) ||
+		    !ker_addr_ok(g_end)) {
+			g_text = g_end = 0;
+			return false;
 		}
 	}
+	return addr >= g_text && addr < g_end;
+}
 
-	pgd = pgd_offset(g_init_mm, addr);
-	if (pgd_none(*pgd) || pgd_bad(*pgd))
-		return 0;
+static __nocfi unsigned long find_kernel_phys(unsigned long addr)
+{
+	unsigned long fn;
+	unsigned long voff;
+	unsigned long pfn;
 
-	p4d = p4d_offset(pgd, addr);
-	if (p4d_none(*p4d) || p4d_bad(*p4d))
-		return 0;
+	if (kernel_image_addr(addr)) {
+		if (!g_kimage_voffset) {
+			fn = hk_resolve("kimage_voffset");
+			if (!fn || !ker_addr_ok(fn)) {
+				pr_warn("[lkmhook] kimage_voffset not found\n");
+				return 0;
+			}
+			if (copy_from_kernel_nofault(&voff, (void *)fn,
+						     sizeof(voff))) {
+				pr_warn("[lkmhook] kimage_voffset unreadable\n");
+				return 0;
+			}
+			g_kimage_voffset = voff;
+		}
+		return addr - g_kimage_voffset;
+	}
 
-	pud = pud_offset(p4d, addr);
-	if (pud_none(*pud))
+	if (!is_vmalloc_addr((void *)addr))
 		return 0;
-#if defined(pud_leaf)
-	if (pud_leaf(*pud))
-		return __pud_to_phys(*pud) + (addr & ~PUD_MASK);
-#endif
-	if (pud_bad(*pud))
+	if (!g_vmalloc_to_pfn_fn) {
+		fn = hk_resolve("vmalloc_to_pfn");
+		if (!fn || !ker_addr_ok(fn)) {
+			pr_warn("[lkmhook] vmalloc_to_pfn not found\n");
+			return 0;
+		}
+		g_vmalloc_to_pfn_fn = (unsigned long (*)(const void *))fn;
+	}
+	pfn = g_vmalloc_to_pfn_fn((const void *)addr);
+	if (!pfn)
 		return 0;
-
-	pmd = pmd_offset(pud, addr);
-	if (pmd_none(*pmd))
-		return 0;
-#if defined(pmd_leaf)
-	if (pmd_leaf(*pmd))
-		return __pmd_to_phys(*pmd) + (addr & ~PMD_MASK);
-#endif
-	if (pmd_bad(*pmd))
-		return 0;
-
-	pte = pte_offset_kernel(pmd, addr);
-	if (!pte || !pte_present(*pte))
-		return 0;
-
-	return __pte_to_phys(*pte) + (addr & ~PAGE_MASK);
+	return (pfn << PAGE_SHIFT) + (addr & ~PAGE_MASK);
 }
 
 static __nocfi void call_clean_inval(unsigned long start, unsigned long end)
 {
+	unsigned long fn;
+
 	if (!g_clean_inval) {
-		g_clean_inval = (clean_inval_fn)hk_resolve(
-			"caches_clean_inval_pou");
-		if (!g_clean_inval)
-			g_clean_inval = (clean_inval_fn)hk_resolve(
-				"dcache_clean_inval_poc");
-		if (!g_clean_inval)
-			g_clean_inval = (clean_inval_fn)hk_resolve(
-				"flush_dcache_range");
+		fn = hk_resolve("caches_clean_inval_pou");
+		if (fn)
+			g_clean_inval = (clean_inval_fn)fn;
+		if (!g_clean_inval) {
+			fn = hk_resolve("dcache_clean_inval_poc");
+			if (fn)
+				g_clean_inval = (clean_inval_fn)fn;
+		}
+		if (!g_clean_inval) {
+			fn = hk_resolve("flush_dcache_range");
+			if (fn)
+				g_clean_inval = (clean_inval_fn)fn;
+		}
+		if (!g_clean_inval) {
+			fn = hk_resolve("__flush_icache_range");
+			if (fn)
+				g_clean_inval = (clean_inval_fn)fn;
+		}
 		if (!g_clean_inval) {
 			pr_warn("[lkmhook] no cache clean fn\n");
 			return;
@@ -123,7 +137,7 @@ int hk_patch_write(void *dst, unsigned long val)
 	unsigned long addr = (unsigned long)dst;
 
 	spin_lock_irqsave(&patch_lock, flags);
-	phys = virt_to_phys_walk(addr);
+	phys = find_kernel_phys(addr);
 	if (!phys) {
 		spin_unlock_irqrestore(&patch_lock, flags);
 		return -EIO;
@@ -139,85 +153,18 @@ int hk_patch_write(void *dst, unsigned long val)
 	return 0;
 }
 
-struct patch_info {
-	void *dst;
-	const void *src;
-	size_t len;
-	int flags;
-	atomic_t cpu_count;
-};
-
-bool hk_patch_guarded(void *addr)
+static int __nocfi patch_text_locked(unsigned long addr, const void *src,
+				     size_t len, int flags)
 {
-	unsigned long v = (unsigned long)addr;
-	pgd_t *pgd;
-	p4d_t *p4d;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *pte;
-
-	if (!ker_addr_ok(v))
-		return false;
-	if (!g_init_mm) {
-		g_init_mm = (struct mm_struct *)hk_resolve("init_mm");
-		if (!g_init_mm)
-			return false;
-	}
-
-	pgd = pgd_offset(g_init_mm, v);
-	if (pgd_none(*pgd) || pgd_bad(*pgd))
-		return false;
-
-	p4d = p4d_offset(pgd, v);
-	if (p4d_none(*p4d) || p4d_bad(*p4d))
-		return false;
-
-	pud = pud_offset(p4d, v);
-	if (pud_none(*pud))
-		return false;
-#if defined(pud_leaf)
-	if (pud_leaf(*pud))
-		return !!(pud_val(*pud) & PTE_GP);
-#endif
-	if (pud_bad(*pud))
-		return false;
-
-	pmd = pmd_offset(pud, v);
-	if (pmd_none(*pmd))
-		return false;
-#if defined(pmd_leaf)
-	if (pmd_leaf(*pmd))
-		return !!(pmd_val(*pmd) & PTE_GP);
-#endif
-	if (pmd_bad(*pmd))
-		return false;
-
-	pte = pte_offset_kernel(pmd, v);
-	if (!pte || !pte_present(*pte))
-		return false;
-	return !!(pte_val(*pte) & PTE_GP);
-}
-
-static int __nocfi patch_text_cb(void *arg)
-{
-	struct patch_info *p = arg;
-	unsigned long addr = (unsigned long)p->dst;
-	size_t left = p->len;
+	size_t left = len;
 	int ret = 0;
-
-	if (atomic_inc_return(&p->cpu_count) != num_online_cpus()) {
-		while (atomic_read(&p->cpu_count) <= num_online_cpus())
-			cpu_relax();
-		isb();
-		return 0;
-	}
 
 	while (left) {
 		unsigned long phys;
 		unsigned long fixmap_va;
 		size_t chunk;
 
-		phys = virt_to_phys_walk(addr);
+		phys = find_kernel_phys(addr);
 		if (!phys) {
 			ret = -ENOENT;
 			break;
@@ -228,38 +175,31 @@ static int __nocfi patch_text_cb(void *arg)
 				PAGE_KERNEL);
 		fixmap_va = fix_to_virt(FIX_TEXT_POKE0) +
 			    (phys & ~PAGE_MASK);
-		memcpy((void *)fixmap_va, p->src, chunk);
+		memcpy((void *)fixmap_va, src, chunk);
 		call_set_fixmap(FIX_TEXT_POKE0, 0, __pgprot(0));
 
-		if (p->flags & HK_PATCH_FLUSH_DCACHE)
+		if (flags & HK_PATCH_FLUSH_DCACHE)
 			call_clean_inval(addr, addr + chunk);
-		if (p->flags & HK_PATCH_FLUSH_ICACHE) {
-			asm volatile("ic ivau, %0" :: "r"(addr));
-			asm volatile("dsb ish");
-			asm volatile("isb");
-		}
+		if (flags & HK_PATCH_FLUSH_ICACHE)
+			hk_flush_icache(addr);
 
-		p->src += chunk;
+		src += chunk;
 		addr += chunk;
 		left -= chunk;
 	}
-
-	atomic_inc(&p->cpu_count);
 	return ret;
 }
 
 int hk_patch_text(void *dst, const void *src, size_t len, int flags)
 {
-	struct patch_info info = {
-		.dst = dst,
-		.src = src,
-		.len = len,
-		.flags = flags,
-		.cpu_count = ATOMIC_INIT(0),
-	};
+	unsigned long lock_flags;
+	int ret;
 
 	if (!dst || !src || !len)
 		return -EINVAL;
 
-	return stop_machine(patch_text_cb, &info, cpu_online_mask);
+	spin_lock_irqsave(&patch_lock, lock_flags);
+	ret = patch_text_locked((unsigned long)dst, src, len, flags);
+	spin_unlock_irqrestore(&patch_lock, lock_flags);
+	return ret;
 }
