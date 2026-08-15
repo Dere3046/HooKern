@@ -188,7 +188,7 @@ int hk_inline_hook(struct hk_inline *h, const char *sym,
 	h->name = sym;
 	h->addr = addr;
 	h->window = window;
-	h->stub = (void *)stub;
+	h->stub = (void *)(stub + 8);
 	pr_info("[lkmhook] inline %s @ 0x%lx window=%u tramp=%px\n",
 		sym, addr, window, (void *)stub);
 	return 0;
