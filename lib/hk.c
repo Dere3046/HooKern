@@ -13,7 +13,7 @@
 
 static struct hk_cfg g_cfg;
 
-unsigned long hk_resolve(const char *name)
+__nocfi noinline unsigned long hk_resolve(const char *name)
 {
 	if (g_cfg.resolve)
 		return g_cfg.resolve(name);

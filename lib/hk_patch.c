@@ -46,7 +46,7 @@ static bool kernel_image_addr(unsigned long addr)
 	return addr >= g_text && addr < g_end;
 }
 
-static __nocfi unsigned long find_kernel_phys(unsigned long addr)
+static __nocfi noinline unsigned long find_kernel_phys(unsigned long addr)
 {
 	unsigned long fn;
 	unsigned long voff;
@@ -85,7 +85,7 @@ static __nocfi unsigned long find_kernel_phys(unsigned long addr)
 	return (pfn << PAGE_SHIFT) + (addr & ~PAGE_MASK);
 }
 
-static __nocfi void call_clean_inval(unsigned long start, unsigned long end)
+static __nocfi noinline void call_clean_inval(unsigned long start, unsigned long end)
 {
 	unsigned long fn;
 
@@ -116,7 +116,7 @@ static __nocfi void call_clean_inval(unsigned long start, unsigned long end)
 	g_clean_inval(start, end);
 }
 
-static __nocfi void call_set_fixmap(unsigned long idx, phys_addr_t phys,
+static __nocfi noinline void call_set_fixmap(unsigned long idx, phys_addr_t phys,
 				    pgprot_t prot)
 {
 	if (!g_set_fixmap) {

@@ -12,6 +12,11 @@ struct hk_cfg {
 	unsigned long (*resolve)(const char *name);
 };
 
+static inline bool hk_ker_addr_ok(unsigned long v)
+{
+	return v >= 0xffff000000000000UL;
+}
+
 int hk_init(const struct hk_cfg *cfg);
 void hk_exit(void);
 unsigned long hk_resolve(const char *name);

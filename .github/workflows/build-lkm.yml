@@ -30,9 +30,15 @@ jobs:
         run: |
           git clone https://github.com/Dere3046/KallRecon.git deps/KallRecon
           git -C deps/KallRecon checkout 63163fd477897fad97639f5ebca77af655499add
-      - name: Build
+          git clone https://github.com/Dere3046/Type_info.git deps/Type_info
+          git -C deps/Type_info checkout 68c7b2ebb24c53c59cb994091af2a91075a29936
+      - name: Build default
         run: make
+      - name: Build LSM
+        run: make HK_LSM=1 VER=lsm
       - uses: actions/upload-artifact@v4
         with:
           name: lkmhook-${{ matrix.kmi }}
-          path: out/lkmhook.ko
+          path: |
+            out/lkmhook.ko
+            out/lsm/lkmhook.ko

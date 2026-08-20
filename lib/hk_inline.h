@@ -8,19 +8,23 @@
 
 #include <linux/types.h>
 
-#define HK_INLINE_WINDOW_MIN 20
-#define HK_INLINE_WINDOW_MAX 32
+#define HK_INLINE_ENTRY_MAX 5
 
 struct hk_inline {
 	const char *name;
 	unsigned long addr;
+	unsigned long orig;
+	void *mem;
+	size_t mem_size;
 	u32 window;
-	void *stub;
-	u8 saved[HK_INLINE_WINDOW_MIN];
+	bool disabled;
+	u8 saved[HK_INLINE_ENTRY_MAX * 4];
 };
 
 int hk_inline_hook(struct hk_inline *h, const char *sym,
-		   const char *stub_sym, const char *wrapper_sym);
+		   const char *wrapper_sym);
+int hk_inline_disable(struct hk_inline *h);
+void hk_inline_free(struct hk_inline *h);
 void hk_inline_unhook(struct hk_inline *h);
 
 #endif
