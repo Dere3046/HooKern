@@ -21,4 +21,7 @@ int hk_kprobe_install(struct hk_kprobe *h, const char *sym,
 void hk_kprobe_remove(struct hk_kprobe *h);
 void hk_kprobe_exit(void);
 
+int hk_kprobe_clear_blacklist(void);
+void hk_kprobe_restore_blacklist(void);
+
 #endif
