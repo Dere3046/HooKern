@@ -28,10 +28,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Fetch deps
         run: |
-          git clone https://github.com/Dere3046/KallRecon.git deps/KallRecon
-          git -C deps/KallRecon checkout 63163fd477897fad97639f5ebca77af655499add
-          git clone https://github.com/Dere3046/Type_info.git deps/Type_info
-          git -C deps/Type_info checkout 68c7b2ebb24c53c59cb994091af2a91075a29936
+          ./scripts/fetch-deps.sh
       - name: Build default
         run: make
       - name: Build LSM
