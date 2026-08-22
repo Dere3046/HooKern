@@ -73,6 +73,46 @@ int hk_kretprobe_install(struct hk_kretprobe *h, const char *sym,
 	return 0;
 }
 
+int hk_kretprobe_install_ex(struct hk_kretprobe *h, const char *sym,
+			    kretprobe_handler_t entry,
+			    kretprobe_handler_t handler,
+			    size_t data_size)
+{
+	unsigned long flags;
+	int i;
+	int ret;
+
+	if (!h || !sym || !handler)
+		return -EINVAL;
+
+	memset(h, 0, sizeof(*h));
+	h->rp.kp.symbol_name = sym;
+	h->rp.entry_handler = entry;
+	h->rp.handler = handler;
+	h->rp.data_size = data_size;
+
+	ret = call_register_kretprobe(&h->rp);
+	if (ret < 0)
+		return ret;
+
+	spin_lock_irqsave(&g_kretprobe_lock, flags);
+	for (i = 0; i < HK_KRETPROBE_MAX; i++) {
+		if (!g_kretprobes[i]) {
+			g_kretprobes[i] = h;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&g_kretprobe_lock, flags);
+
+	if (i == HK_KRETPROBE_MAX) {
+		pr_warn("[lkmhook] kretprobe table full %s\n", sym);
+		call_unregister_kretprobe(&h->rp);
+		return -ENOSPC;
+	}
+
+	return 0;
+}
+
 void hk_kretprobe_remove(struct hk_kretprobe *h)
 {
 	unsigned long flags;

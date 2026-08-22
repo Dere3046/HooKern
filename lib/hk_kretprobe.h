@@ -17,6 +17,10 @@ struct hk_kretprobe {
 
 int hk_kretprobe_install(struct hk_kretprobe *h, const char *sym,
 			 kretprobe_handler_t handler);
+int hk_kretprobe_install_ex(struct hk_kretprobe *h, const char *sym,
+			    kretprobe_handler_t entry,
+			    kretprobe_handler_t handler,
+			    size_t data_size);
 void hk_kretprobe_remove(struct hk_kretprobe *h);
 void hk_kretprobe_exit(void);
 
