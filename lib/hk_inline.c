@@ -4,6 +4,7 @@
  */
 
 #include <linux/errno.h>
+#include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -41,6 +42,21 @@
 
 /* serializes every install and restore, see the note at the lock site */
 static DEFINE_MUTEX(g_inline_lock);
+
+/*
+ * one node per live hook window, under g_inline_lock. the window belongs to the
+ * install and is handed back by hk_inline_disable or hk_inline_free, so a second
+ * hook can take the address once the first entry is restored. the hook pointer
+ * is the name of the node, a symbol the caller keeps alive while it is hooked
+ */
+struct hk_inline_own {
+	struct list_head list;
+	struct hk_inline *hook;
+	unsigned long start;
+	u32 len;
+};
+
+static LIST_HEAD(g_inline_owned);
 
 typedef enum {
 	HK_INST_B = 1,
@@ -417,11 +433,128 @@ static __nocfi noinline void hk_exec_free(void *mem)
 }
 
 static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
-				   const char *wrapper_sym);
+				   const char *wrapper_sym,
+				   unsigned long addr);
+
+/* the entry address a hook on sym patches: the resolver result with the same
+ * branch chain walked, so the collision window and the probe agree */
+static __nocfi unsigned long hk_read_addr(const char *sym)
+{
+	unsigned long addr;
+
+	addr = hk_resolve(sym);
+	if (!addr)
+		return 0;
+	hk_resolve_branch_chain(addr, &addr);
+	return addr;
+}
+
+/* the window of another live hook that overlaps [start, start + len), NULL when
+ * the range is free. the caller holds g_inline_lock */
+static const struct hk_inline_own *hk_inline_overlap(unsigned long start,
+						     u32 len)
+{
+	const struct hk_inline_own *ent;
+	unsigned long end = start + len;
+
+	list_for_each_entry(ent, &g_inline_owned, list) {
+		if (start < ent->start + ent->len && ent->start < end)
+			return ent;
+	}
+	return NULL;
+}
+
+/* name both sides of the overlap, the caller holds g_inline_lock */
+static void hk_inline_report(const char *what, const char *sym,
+			     unsigned long start, u32 len,
+			     const struct hk_inline_own *other)
+{
+	pr_warn("[lkmhook] %s %s window 0x%lx+%u collides with %s 0x%lx+%u\n",
+		what, sym, start, len,
+		other->hook->name ? other->hook->name : "?",
+		other->start, other->len);
+}
+
+/*
+ * claim [start, start + len) for h, -EBUSY when another live hook owns part of
+ * it. a claim is taken before any text is read or written and a failed install
+ * hands it back, so every claim has an owner that can release it
+ */
+static int hk_inline_own(struct hk_inline *h, const char *sym,
+			 unsigned long start, u32 len)
+{
+	const struct hk_inline_own *other;
+	struct hk_inline_own *own;
+	struct hk_inline_own *ent;
+
+	mutex_lock(&g_inline_lock);
+	list_for_each_entry(ent, &g_inline_owned, list) {
+		if (ent->hook != h)
+			continue;
+		pr_warn("[lkmhook] inline %s already installed\n", sym);
+		mutex_unlock(&g_inline_lock);
+		return -EBUSY;
+	}
+	other = hk_inline_overlap(start, len);
+	if (other) {
+		hk_inline_report("inline", sym, start, len, other);
+		mutex_unlock(&g_inline_lock);
+		return -EBUSY;
+	}
+
+	own = kzalloc(sizeof(*own), GFP_KERNEL);
+	if (!own) {
+		mutex_unlock(&g_inline_lock);
+		return -ENOMEM;
+	}
+	own->hook = h;
+	own->start = start;
+	own->len = len;
+	list_add(&own->list, &g_inline_owned);
+	mutex_unlock(&g_inline_lock);
+	return 0;
+}
+
+/* hand the window back so a later install can take it */
+static void hk_inline_release(const struct hk_inline *h)
+{
+	struct hk_inline_own *ent;
+
+	mutex_lock(&g_inline_lock);
+	list_for_each_entry(ent, &g_inline_owned, list) {
+		if (ent->hook != h)
+			continue;
+		list_del(&ent->list);
+		mutex_unlock(&g_inline_lock);
+		kfree(ent);
+		return;
+	}
+	mutex_unlock(&g_inline_lock);
+}
+
+/* the probe half of the claim: name the live window that would refuse an install
+ * on [start, start + len), 0 when the range is free */
+static int hk_inline_collide(const char *sym, unsigned long start, u32 len,
+			     unsigned long *out)
+{
+	const struct hk_inline_own *other;
+
+	mutex_lock(&g_inline_lock);
+	other = hk_inline_overlap(start, len);
+	if (!other) {
+		mutex_unlock(&g_inline_lock);
+		return 0;
+	}
+	*out = other->start;
+	hk_inline_report("probe", sym, start, len, other);
+	mutex_unlock(&g_inline_lock);
+	return -EBUSY;
+}
 
 __nocfi int hk_inline_hook(struct hk_inline *h, const char *sym,
-		   const char *wrapper_sym)
+			   const char *wrapper_sym)
 {
+	unsigned long addr;
 	int ret;
 
 	if (!h || !sym || !wrapper_sym)
@@ -440,19 +573,24 @@ __nocfi int hk_inline_hook(struct hk_inline *h, const char *sym,
 	 * symbols. the split has to come first: prepare under this lock, then
 	 * commit the detour from a callback that does neither
 	 */
+	addr = hk_read_addr(sym);
+	ret = hk_inline_own(h, sym, addr, HK_INLINE_PATCH_LEN);
+	if (ret)
+		return ret;
 	mutex_lock(&g_inline_lock);
-	ret = hk_inline_apply(h, sym, wrapper_sym);
+	ret = hk_inline_apply(h, sym, wrapper_sym, addr);
 	mutex_unlock(&g_inline_lock);
+	if (ret)
+		hk_inline_release(h);
 	return ret;
 }
 
 static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
-				   const char *wrapper_sym)
+				   const char *wrapper_sym, unsigned long addr)
 {
 	struct hk_relo_ctx ctx;
 	u32 *tramp;
 	u32 detour[HK_INLINE_ENTRY_MAX];
-	unsigned long addr;
 	unsigned long wrapper;
 	unsigned long mem;
 	u32 i;
@@ -464,7 +602,6 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	if (!tramp)
 		return -ENOMEM;
 
-	addr = hk_resolve(sym);
 	if (!addr) {
 		pr_warn("[lkmhook] inline resolve %s failed\n", sym);
 		return -ENODATA;
@@ -474,7 +611,6 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 		pr_warn("[lkmhook] inline resolve %s failed\n", wrapper_sym);
 		return -ENODATA;
 	}
-	hk_resolve_branch_chain(addr, &addr);
 	pr_info("[lkmhook] P1 addr=0x%lx\n", addr);
 	if (!hk_ker_addr_ok(addr))
 		return -EINVAL;
@@ -486,6 +622,9 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	}
 	h->mem = (void *)mem;
 	h->mem_size = HK_TRAMP_SIZE;
+	h->addr = addr;
+	h->window = HK_INLINE_PATCH_LEN;
+	h->name = sym;
 
 	tramp[0] = HK_INS_BTI_JC;
 	tramp[1] = HK_INS_LDR_X17;
@@ -526,9 +665,6 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 		goto err_free;
 
 	h->orig = mem + 20;
-	h->addr = addr;
-	h->window = HK_INLINE_PATCH_LEN;
-	h->name = sym;
 
 	detour[0] = HK_INS_BTI_JC;
 	detour[1] = HK_INS_LDR_X17;
@@ -569,12 +705,16 @@ int hk_inline_disable(struct hk_inline *h)
 		return 0;
 	}
 	if (hk_patch_text((void *)h->addr, h->saved, HK_INLINE_PATCH_LEN,
-			  HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE))
-		ret = -EIO;
-	else
-		h->disabled = true;
+			  HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE)) {
+		mutex_unlock(&g_inline_lock);
+		return -EIO;
+	}
+	h->disabled = true;
 	mutex_unlock(&g_inline_lock);
-	return ret;
+
+	/* the entry is the caller's bytes again, the window is up for grabs */
+	hk_inline_release(h);
+	return 0;
 }
 
 void hk_inline_free(struct hk_inline *h)
@@ -596,6 +736,14 @@ void hk_inline_free(struct hk_inline *h)
 	h->mem = NULL;
 	h->disabled = false;
 	mutex_unlock(&g_inline_lock);
+
+	/*
+	 * hk_inline_disable already handed the window back, this is the release
+	 * for a hook that never reached disable. the node keeps no bytes, the
+	 * entry still carries the last detour, so a claim taken here covers
+	 * bytes the caller has to restore itself
+	 */
+	hk_inline_release(h);
 }
 
 void hk_inline_unhook(struct hk_inline *h)
@@ -774,6 +922,14 @@ __nocfi int hk_inline_probe(const char *sym, struct hk_inline_probe *out)
 		return 0;
 	}
 	out->target = target;
+
+	/* the entry is not judged further, an install onto it is refused */
+	if (hk_inline_collide(sym, target, HK_INLINE_PATCH_LEN,
+			      &out->collide_addr)) {
+		out->state = HK_INLINE_COLLISION;
+		out->reason = "window owned by a live hook";
+		return 0;
+	}
 
 	if (hk_read_code(target, raw, sizeof(raw))) {
 		out->state = HK_INLINE_UNREADABLE;
