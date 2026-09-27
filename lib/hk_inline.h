@@ -39,13 +39,14 @@ struct hk_inline {
  * it, which is why one lock covers them today
  *
  * the detour covers HK_INLINE_PATCH_LEN bytes from the entry, so a target whose symbol is
- * shorter than that shares its window with the next function, and two hooks whose windows
- * overlap each save and restore the other's bytes. the entry needs that much room of its
- * own, hk_inline_probe reports the length it would write
+ * shorter than that shares its window with the next function. the library records the
+ * window of every live hook and refuses an install that overlaps one, -EBUSY names both
+ * symbols, hk_inline_probe reports the length it would write and the same collision
  */
 int hk_inline_hook(struct hk_inline *h, const char *sym,
 		   const char *wrapper_sym);
-/* restore the entry, -EIO when the write fails and the hook stays live */
+/* restore the entry, -EIO when the write fails and the hook stays live. the
+ * window is released with the restore, a later install may take it */
 int hk_inline_disable(struct hk_inline *h);
 void hk_inline_free(struct hk_inline *h);
 void hk_inline_unhook(struct hk_inline *h);
@@ -62,6 +63,7 @@ enum hk_inline_state {
 	HK_INLINE_PATCHSITE,		/* an ftrace patch site, the entry is live */
 	HK_INLINE_BRANCHED,		/* a direct b in the entry, see target */
 	HK_INLINE_PLAIN,		/* no known stub, relocator accepts */
+	HK_INLINE_COLLISION,		/* a live hook owns part of the window */
 };
 
 struct hk_inline_probe {
@@ -70,6 +72,7 @@ struct hk_inline_probe {
 	u32 patch_len;		/* bytes the detour overwrites there, HK_INLINE_PATCH_LEN */
 	enum hk_inline_state state;
 	const char *reason;	/* static string, the caller never owns it */
+	unsigned long collide_addr;	/* start of the window in the way, 0 when free */
 };
 
 /*
@@ -85,6 +88,10 @@ struct hk_inline_probe {
  * add br stub and a patch that leaves the first instructions alone are not
  * recognised, so plain means no known stub was found, it is not proof of an
  * untouched prologue.
+ *
+ * collision means another live hook owns part of the window, the install would
+ * return -EBUSY, and collide_addr is the start of that window. the probe reads
+ * the installed window table, a hook installed after the probe is not in it
  *
  * 0 when the report was filled, -EINVAL on a NULL argument.
  */

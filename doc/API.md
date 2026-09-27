@@ -87,6 +87,11 @@ through an absolute LDR X17 + RET X17 jump, so there is no ±128 MB
 range limit. h->orig points to the trampoline entry, call it from the
 wrapper to run the original function.
 
+the library records the window of every live hook. an install whose
+window overlaps one is refused with -EBUSY, the log line names both
+symbols, nothing is written. hk_inline_probe answers the same condition
+before an install is attempted.
+
 installs are serialized by a mutex held across trampoline allocation,
 relocation and the text writes, so two hooks cannot interleave and a
 restore cannot run inside an install. the write itself is still not
@@ -99,8 +104,7 @@ before the callback can carry the last write.
 
 the detour covers HK_INLINE_PATCH_LEN bytes from the entry, so the
 entry needs that much room of its own. a shorter symbol shares its
-window with the next function and two hooks whose windows overlap each
-save and restore the other's bytes, hk_inline_probe reports the length.
+window with the next function, hk_inline_probe reports the length.
 
 wrapper_sym must be a global symbol (LTO localizes static ones and
 drops the names from kallsyms). addresses come from the resolver, not
@@ -135,13 +139,15 @@ struct hk_inline {
 **int hk_inline_disable(struct hk_inline *h)**
 
 restore the original entry but keep the trampoline alive. use before
-waiting for in-flight calls. runs under the same install lock. -EIO
-when the write fails, the hook stays live and the trampoline stays
-allocated, call it again.
+waiting for in-flight calls. runs under the same install lock. the
+window is released with the restore, a later install can take it. -EIO
+when the write fails, the hook stays live, the window stays held and
+the trampoline stays allocated, call it again.
 
 **void hk_inline_free(struct hk_inline *h)**
 
-free the trampoline after disable. safe to call on a zeroed hook.
+free the trampoline after disable and release the window. safe to call
+on a zeroed hook.
 
 **void hk_inline_unhook(struct hk_inline *h)**
 
@@ -163,6 +169,7 @@ struct hk_inline_probe {
 	u32 patch_len;		/* bytes the detour overwrites there */
 	enum hk_inline_state state;
 	const char *reason;	/* static string, the caller never owns it */
+	unsigned long collide_addr;	/* start of the window in the way */
 };
 ```
 
@@ -180,7 +187,12 @@ HK_INLINE_BRANCHED     a direct b in the entry, target is where a hook would
                        write, the end of the chain when the walk follows it
                        and the entry itself when it does not
 HK_INLINE_PLAIN        no known stub, the relocator accepts the window
+HK_INLINE_COLLISION    a live hook owns part of the window, an install
+                       would return -EBUSY, collide_addr is its start
 ```
+
+the collision answer comes from the window table the installs keep, so it
+holds for the hooks already live when the probe runs.
 
 every state except plain means the entry should not be patched as it
 stands. plain is signature based: an adrp add br stub, a patch that
