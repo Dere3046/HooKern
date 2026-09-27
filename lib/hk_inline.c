@@ -692,8 +692,6 @@ err_free:
 
 int hk_inline_disable(struct hk_inline *h)
 {
-	int ret = 0;
-
 	/* the restore is a text write too, keep it off a concurrent install */
 	mutex_lock(&g_inline_lock);
 	if (!h || !h->addr) {
