@@ -3,20 +3,34 @@
  * Copyright (C) 2026 dere3046
  */
 
+#include <linux/errno.h>
+#include <linux/kprobes.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
+#include <linux/types.h>
 
 #include "hk.h"
 #include "hk_kprobe.h"
 
 typedef int (*register_kprobe_fn)(struct kprobe *p);
 typedef void (*unregister_kprobe_fn)(struct kprobe *p);
+typedef bool (*within_blacklist_fn)(unsigned long addr);
+typedef int (*core_text_fn)(unsigned long addr);
+typedef bool (*module_text_fn)(unsigned long addr);
+typedef unsigned long (*ftrace_location_fn)(unsigned long ip);
 
-static struct hk_kprobe *g_kprobes[HK_KPROBE_MAX];
+/* one tracking node per live probe, the list has no ceiling */
+struct hk_kprobe_node {
+	struct list_head list;
+	struct hk_kprobe *hook;
+};
+
+static LIST_HEAD(g_kprobes);
 static DEFINE_SPINLOCK(g_kprobe_lock);
 
 struct hk_blacklist_saved {
@@ -40,49 +54,160 @@ static __nocfi int call_register_kprobe(struct kprobe *p)
 	return fn(p);
 }
 
-static __nocfi void call_unregister_kprobe(struct kprobe *p)
+static __nocfi int call_unregister_kprobe(struct kprobe *p)
 {
 	unregister_kprobe_fn fn;
 
 	fn = (unregister_kprobe_fn)hk_resolve("unregister_kprobe");
 	if (!fn)
-		return;
+		return -ENODATA;
 	fn(p);
+	return 0;
+}
+
+static __nocfi bool call_within_blacklist(unsigned long addr)
+{
+	within_blacklist_fn fn;
+
+	fn = (within_blacklist_fn)hk_resolve("within_kprobe_blacklist");
+	return fn ? fn(addr) : false;
+}
+
+static __nocfi bool call_core_text(unsigned long addr)
+{
+	core_text_fn fn;
+
+	fn = (core_text_fn)hk_resolve("core_kernel_text");
+	if (!fn)
+		return hk_ker_addr_ok(addr);
+	return fn(addr);
+}
+
+static __nocfi bool call_module_text(unsigned long addr)
+{
+	module_text_fn fn;
+
+	fn = (module_text_fn)hk_resolve("is_module_text_address");
+	return fn ? fn(addr) : false;
+}
+
+/* the kernel takes core kernel text or module text, a rodata symbol is refused */
+static __nocfi bool call_text_addr(unsigned long addr)
+{
+	return call_core_text(addr) || call_module_text(addr);
+}
+
+static __nocfi unsigned long call_ftrace_location(unsigned long addr)
+{
+	ftrace_location_fn fn;
+
+	fn = (ftrace_location_fn)hk_resolve("ftrace_location");
+	return fn ? fn(addr) : 0;
+}
+
+/*
+ * the address gates of register_kprobe in its own order. every one of them
+ * comes back as -EINVAL, so the caller has to be told which one fired
+ */
+static __nocfi enum hk_kprobe_state hk_kprobe_gate(const char *sym,
+						   unsigned long *addr,
+						   const char **reason)
+{
+	unsigned long a;
+
+	a = *sym ? hk_resolve(sym) : 0;
+	if (!a) {
+		*addr = 0;
+		*reason = "symbol not resolved";
+		return HK_KPROBE_UNRESOLVED;
+	}
+	*addr = a;
+
+	if (str_has_prefix(sym, "__cfi_") || str_has_prefix(sym, "__pfx_")) {
+		*reason = "cfi preamble symbol";
+		return HK_KPROBE_UNSUPPORTED;
+	}
+	if (!call_text_addr(a)) {
+		*reason = "not kernel text";
+		return HK_KPROBE_UNSUPPORTED;
+	}
+	if (call_within_blacklist(a)) {
+		*reason = "kprobe blacklist, clear with hk_kprobe_clear_blacklist";
+		return HK_KPROBE_BLACKLISTED;
+	}
+#ifndef CONFIG_KPROBES_ON_FTRACE
+	/* arm64 never selects it, there a recorded call site is refused */
+	if (call_ftrace_location(a) == a) {
+		*reason = "ftrace call site";
+		return HK_KPROBE_PATCHSITE;
+	}
+#endif
+	*reason = "no address gate matched";
+	return HK_KPROBE_OK;
+}
+
+int hk_kprobe_check(const char *sym, struct hk_kprobe_report *out)
+{
+	if (!sym || !out)
+		return -EINVAL;
+
+	memset(out, 0, sizeof(*out));
+	out->state = hk_kprobe_gate(sym, &out->addr, &out->reason);
+	return 0;
+}
+
+/* a refused install names the symbol and the gate, never a bare errno */
+static void hk_kprobe_fail(const char *sym, int ret)
+{
+	struct hk_kprobe_report rep;
+
+	if (hk_kprobe_check(sym, &rep))
+		return;
+	pr_warn("[lkmhook] kprobe %s failed %d %s\n", sym, ret, rep.reason);
+}
+
+/* an unregistered probe on module text is a use after free, say so */
+static void hk_kprobe_drop(struct hk_kprobe *h)
+{
+	if (!call_unregister_kprobe(&h->kp))
+		return;
+	pr_warn("[lkmhook] kprobe %s left registered, unregister_kprobe unresolved\n",
+		h->kp.symbol_name ? h->kp.symbol_name : "?");
 }
 
 int hk_kprobe_install(struct hk_kprobe *h, const char *sym,
 		      kprobe_pre_handler_t pre)
 {
+	struct hk_kprobe_node *node;
 	unsigned long flags;
-	int i;
 	int ret;
 
 	if (!h || !sym || !pre)
 		return -EINVAL;
+
+	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	if (!node) {
+		pr_warn("[lkmhook] kprobe %s failed -ENOMEM, no tracking node\n",
+			sym);
+		return -ENOMEM;
+	}
 
 	memset(h, 0, sizeof(*h));
 	h->kp.symbol_name = sym;
 	h->kp.pre_handler = pre;
 
 	ret = call_register_kprobe(&h->kp);
-	if (ret < 0)
+	if (ret < 0) {
+		kfree(node);
+		hk_kprobe_fail(sym, ret);
 		return ret;
+	}
 	h->orig = (unsigned long)h->kp.addr;
 
+	node->hook = h;
 	spin_lock_irqsave(&g_kprobe_lock, flags);
-	for (i = 0; i < HK_KPROBE_MAX; i++) {
-		if (!g_kprobes[i]) {
-			g_kprobes[i] = h;
-			break;
-		}
-	}
+	list_add(&node->list, &g_kprobes);
 	spin_unlock_irqrestore(&g_kprobe_lock, flags);
-
-	if (i == HK_KPROBE_MAX) {
-		pr_warn("[lkmhook] kprobe table full %s\n", sym);
-		call_unregister_kprobe(&h->kp);
-		return -ENOSPC;
-	}
 
 	pr_info("[lkmhook] kprobe %s @ 0x%lx\n", sym, h->orig);
 	return 0;
@@ -90,22 +215,30 @@ int hk_kprobe_install(struct hk_kprobe *h, const char *sym,
 
 void hk_kprobe_remove(struct hk_kprobe *h)
 {
+	struct hk_kprobe_node *node;
+	struct hk_kprobe_node *found = NULL;
 	unsigned long flags;
-	int i;
 
 	if (!h)
 		return;
 
-	call_unregister_kprobe(&h->kp);
-
 	spin_lock_irqsave(&g_kprobe_lock, flags);
-	for (i = 0; i < HK_KPROBE_MAX; i++) {
-		if (g_kprobes[i] == h) {
-			g_kprobes[i] = NULL;
-			break;
-		}
+	list_for_each_entry(node, &g_kprobes, list) {
+		if (node->hook != h)
+			continue;
+		list_del(&node->list);
+		found = node;
+		break;
 	}
 	spin_unlock_irqrestore(&g_kprobe_lock, flags);
+
+	/* not tracked means not registered, a second remove is a no op */
+	if (!found)
+		return;
+
+	/* unregister sleeps, it stays outside the list lock */
+	hk_kprobe_drop(h);
+	kfree(found);
 }
 
 int hk_kprobe_clear_blacklist(void)
@@ -189,17 +322,21 @@ void hk_kprobe_restore_blacklist(void)
 
 void hk_kprobe_exit(void)
 {
+	struct hk_kprobe_node *node;
+	struct hk_kprobe_node *tmp;
+	LIST_HEAD(pending);
 	unsigned long flags;
-	int i;
 
+	/* take the list off the lock first, unregister sleeps */
 	spin_lock_irqsave(&g_kprobe_lock, flags);
-	for (i = 0; i < HK_KPROBE_MAX; i++) {
-		if (!g_kprobes[i])
-			continue;
-		call_unregister_kprobe(&g_kprobes[i]->kp);
-		g_kprobes[i] = NULL;
-	}
+	list_splice_init(&g_kprobes, &pending);
 	spin_unlock_irqrestore(&g_kprobe_lock, flags);
+
+	list_for_each_entry_safe(node, tmp, &pending, list) {
+		hk_kprobe_drop(node->hook);
+		list_del(&node->list);
+		kfree(node);
+	}
 
 	hk_kprobe_restore_blacklist();
 }

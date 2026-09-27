@@ -6,6 +6,7 @@
 #include <linux/errno.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/types.h>
@@ -37,6 +38,9 @@
 
 /* dry run sink for the probe, the tables allow 8 words per instruction */
 #define HK_PROBE_SCRATCH 128
+
+/* serializes every install and restore, see the note at the lock site */
+static DEFINE_MUTEX(g_inline_lock);
 
 typedef enum {
 	HK_INST_B = 1,
@@ -412,8 +416,38 @@ static __nocfi noinline void hk_exec_free(void *mem)
 	vfree(mem);
 }
 
+static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
+				   const char *wrapper_sym);
+
 __nocfi int hk_inline_hook(struct hk_inline *h, const char *sym,
 		   const char *wrapper_sym)
+{
+	int ret;
+
+	if (!h || !sym || !wrapper_sym)
+		return -EINVAL;
+
+	/*
+	 * one lock across trampoline allocation, relocation and both text
+	 * writes, so two installs cannot interleave their trampolines or their
+	 * entry windows. the write itself is still a burst of instructions and
+	 * a core that executes the target right now can see half of it, the
+	 * lock only takes the second writer out of the picture
+	 *
+	 * stop_machine is not used around this path. only the last write could
+	 * run from a callback, and a stop_machine callback must neither sleep
+	 * nor allocate while this path allocates the trampoline and resolves
+	 * symbols. the split has to come first: prepare under this lock, then
+	 * commit the detour from a callback that does neither
+	 */
+	mutex_lock(&g_inline_lock);
+	ret = hk_inline_apply(h, sym, wrapper_sym);
+	mutex_unlock(&g_inline_lock);
+	return ret;
+}
+
+static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
+				   const char *wrapper_sym)
 {
 	struct hk_relo_ctx ctx;
 	u32 *tramp;
@@ -425,8 +459,6 @@ __nocfi int hk_inline_hook(struct hk_inline *h, const char *sym,
 	u32 insn;
 	int ret;
 
-	if (!h || !sym || !wrapper_sym)
-		return -EINVAL;
 	memset(h, 0, sizeof(*h));
 	tramp = kzalloc(256, GFP_KERNEL);
 	if (!tramp)
@@ -524,21 +556,36 @@ err_free:
 
 int hk_inline_disable(struct hk_inline *h)
 {
-	if (!h || !h->addr)
+	int ret = 0;
+
+	/* the restore is a text write too, keep it off a concurrent install */
+	mutex_lock(&g_inline_lock);
+	if (!h || !h->addr) {
+		mutex_unlock(&g_inline_lock);
 		return -EINVAL;
-	if (h->disabled)
+	}
+	if (h->disabled) {
+		mutex_unlock(&g_inline_lock);
 		return 0;
-	hk_patch_text((void *)h->addr, h->saved, HK_INLINE_PATCH_LEN,
-		      HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE);
-	h->disabled = true;
-	return 0;
+	}
+	if (hk_patch_text((void *)h->addr, h->saved, HK_INLINE_PATCH_LEN,
+			  HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE))
+		ret = -EIO;
+	else
+		h->disabled = true;
+	mutex_unlock(&g_inline_lock);
+	return ret;
 }
 
 void hk_inline_free(struct hk_inline *h)
 {
-	if (!h)
+	mutex_lock(&g_inline_lock);
+	if (!h) {
+		mutex_unlock(&g_inline_lock);
 		return;
+	}
 	if (h->addr && !h->disabled) {
+		mutex_unlock(&g_inline_lock);
 		pr_warn("[lkmhook] inline free before disable\n");
 		return;
 	}
@@ -548,6 +595,7 @@ void hk_inline_free(struct hk_inline *h)
 	h->orig = 0;
 	h->mem = NULL;
 	h->disabled = false;
+	mutex_unlock(&g_inline_lock);
 }
 
 void hk_inline_unhook(struct hk_inline *h)
