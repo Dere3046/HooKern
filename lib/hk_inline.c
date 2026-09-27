@@ -26,6 +26,17 @@
 #define HK_INS_BLR_X17 0xD63F0220
 #define HK_INS_NOP 0xD503201F
 #define HK_INS_BTI_JC 0xD50324DF
+#define HK_INS_BR_ANY 0xD61F0000
+#define HK_INS_BR_MASK 0xFFFFFC1F
+#define HK_INS_BRK_ANY 0xD4200000
+#define HK_INS_BRK_MASK 0xFFE00000
+#define HK_INS_MOV_MASK 0x7F800000
+#define HK_INS_MOVZ 0x52800000
+#define HK_INS_MOVK 0x72800000
+#define HK_INS_MOV_X9_LR 0xAA1E03E9
+
+/* dry run sink for the probe, the tables allow 8 words per instruction */
+#define HK_PROBE_SCRATCH 128
 
 typedef enum {
 	HK_INST_B = 1,
@@ -150,11 +161,28 @@ static int hk_resolve_branch_chain(unsigned long addr, unsigned long *out)
 struct hk_relo_ctx {
 	u32 *dst;
 	u32 count;
+	const u8 *src;		/* entry window copy, NULL reads tramp_start */
 	unsigned long inst_addr;
 	unsigned long tramp_start;
 	unsigned long tramp_end;
 	unsigned long backup_start;
 };
+
+static __nocfi hk_inst_type_t hk_insn_type(u32 insn)
+{
+	int i;
+
+	for (i = 0; i < (int)ARRAY_SIZE(hk_masks); i++)
+		if ((insn & hk_masks[i]) == hk_types[i])
+			return (hk_inst_type_t)(i + 1);
+	return HK_INST_IGNORE;
+}
+
+/* the tables are 0 based, the instruction types are not */
+static int hk_insn_index(u32 insn)
+{
+	return (int)hk_insn_type(insn) - 1;
+}
 
 static bool hk_in_tramp(const struct hk_relo_ctx *c, u64 addr)
 {
@@ -163,23 +191,18 @@ static bool hk_in_tramp(const struct hk_relo_ctx *c, u64 addr)
 
 static u64 hk_relo_in_tramp(const struct hk_relo_ctx *c, u64 addr)
 {
+	const u8 *src = c->src ? c->src : (const u8 *)c->tramp_start;
 	u64 fix = c->backup_start;
 	u32 inst;
 	u32 idx;
 	int j;
-	int k;
 
 	if (!hk_in_tramp(c, addr))
 		return addr;
 	idx = (addr - c->tramp_start) / 4;
 	for (j = 0; j < (int)idx; j++) {
-		inst = hk_get_insn((const u8 *)(c->tramp_start + j * 4));
-
-		for (k = 0; k < (int)ARRAY_SIZE(hk_masks); k++)
-			if ((inst & hk_masks[k]) == hk_types[k]) {
-				fix += hk_relo_len[k] * 4;
-				break;
-			}
+		inst = hk_get_insn(src + j * 4);
+		fix += hk_relo_len[hk_insn_index(inst)] * 4;
 	}
 	return fix;
 }
@@ -319,14 +342,8 @@ static int hk_relo_tb(struct hk_relo_ctx *c, u32 insn)
 
 static int hk_relo_inst(struct hk_relo_ctx *c, u32 insn)
 {
-	int i;
+	int i = hk_insn_index(insn);
 	int ret = 0;
-
-	for (i = 0; i < (int)ARRAY_SIZE(hk_masks); i++)
-		if ((insn & hk_masks[i]) == hk_types[i])
-			break;
-	if (i == ARRAY_SIZE(hk_masks))
-		i = ARRAY_SIZE(hk_masks) - 1;
 
 	switch (i) {
 	case 0:
@@ -400,7 +417,7 @@ __nocfi int hk_inline_hook(struct hk_inline *h, const char *sym,
 {
 	struct hk_relo_ctx ctx;
 	u32 *tramp;
-	u32 detour[5];
+	u32 detour[HK_INLINE_ENTRY_MAX];
 	unsigned long addr;
 	unsigned long wrapper;
 	unsigned long mem;
@@ -449,7 +466,7 @@ __nocfi int hk_inline_hook(struct hk_inline *h, const char *sym,
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.dst = tramp + 6;
 	ctx.tramp_start = addr;
-	ctx.tramp_end = addr + HK_INLINE_ENTRY_MAX * 4;
+	ctx.tramp_end = addr + HK_INLINE_PATCH_LEN;
 	ctx.backup_start = mem + 24;
 
 	for (i = 0; i < HK_INLINE_ENTRY_MAX; i++) {
@@ -465,8 +482,8 @@ __nocfi int hk_inline_hook(struct hk_inline *h, const char *sym,
 			goto err_free;
 	}
 	pr_info("[lkmhook] P3 count=%u\n", ctx.count);
-	ctx.inst_addr = addr + HK_INLINE_ENTRY_MAX * 4;
-	ret = hk_relo_abs_jump(&ctx, addr + HK_INLINE_ENTRY_MAX * 4);
+	ctx.inst_addr = addr + HK_INLINE_PATCH_LEN;
+	ret = hk_relo_abs_jump(&ctx, addr + HK_INLINE_PATCH_LEN);
 	if (ret)
 		goto err_free;
 
@@ -478,7 +495,7 @@ __nocfi int hk_inline_hook(struct hk_inline *h, const char *sym,
 
 	h->orig = mem + 20;
 	h->addr = addr;
-	h->window = HK_INLINE_ENTRY_MAX * 4;
+	h->window = HK_INLINE_PATCH_LEN;
 	h->name = sym;
 
 	detour[0] = HK_INS_BTI_JC;
@@ -486,10 +503,10 @@ __nocfi int hk_inline_hook(struct hk_inline *h, const char *sym,
 	detour[2] = HK_INS_RET_X17;
 	detour[3] = mem & 0xFFFFFFFF;
 	detour[4] = mem >> 32;
-	ret = hk_patch_text((void *)addr, detour, 20,
+	ret = hk_patch_text((void *)addr, detour, HK_INLINE_PATCH_LEN,
 			    HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE);
 	if (ret) {
-		hk_patch_text((void *)addr, h->saved, 20,
+		hk_patch_text((void *)addr, h->saved, HK_INLINE_PATCH_LEN,
 			      HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE);
 		goto err_free;
 	}
@@ -511,7 +528,7 @@ int hk_inline_disable(struct hk_inline *h)
 		return -EINVAL;
 	if (h->disabled)
 		return 0;
-	hk_patch_text((void *)h->addr, h->saved, 20,
+	hk_patch_text((void *)h->addr, h->saved, HK_INLINE_PATCH_LEN,
 		      HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE);
 	h->disabled = true;
 	return 0;
@@ -539,4 +556,212 @@ void hk_inline_unhook(struct hk_inline *h)
 		return;
 	hk_inline_disable(h);
 	hk_inline_free(h);
+}
+
+/* a resolver result can be stale and a b target is arithmetic, so the probe
+ * never dereferences a target directly */
+static __nocfi int hk_read_code(unsigned long addr, void *dst, size_t len)
+{
+	return copy_from_kernel_nofault(dst, (const void *)addr, len);
+}
+
+static __nocfi int hk_fetch_insn(unsigned long addr, u32 *out)
+{
+	u8 raw[4];
+
+	if (hk_read_code(addr, raw, sizeof(raw)))
+		return -EFAULT;
+	*out = hk_get_insn(raw);
+	return 0;
+}
+
+/* the same walk as hk_resolve_branch_chain, which reads the target directly.
+ * a thunk is a supported hook target, here it is a report */
+static __nocfi int hk_follow_branch(unsigned long addr, unsigned long *out)
+{
+	u32 insn;
+	int depth;
+
+	for (depth = 0; depth < 32; depth++) {
+		if (hk_fetch_insn(addr, &insn))
+			return -EFAULT;
+		if (hk_is_b(insn)) {
+			addr = hk_decode_b_target(insn, addr);
+			continue;
+		}
+		if (!hk_is_hint(insn))
+			break;
+		if (hk_fetch_insn(addr + 4, &insn))
+			return -EFAULT;
+		if (!hk_is_b(insn))
+			break;
+		addr = hk_decode_b_target(insn, addr + 4);
+	}
+	*out = addr;
+	return 0;
+}
+
+static __nocfi bool hk_is_br(u32 insn)
+{
+	return (insn & HK_INS_BR_MASK) == HK_INS_BR_ANY;
+}
+
+static __nocfi bool hk_is_brk(u32 insn)
+{
+	return (insn & HK_INS_BRK_MASK) == HK_INS_BRK_ANY;
+}
+
+/* hint space, wider than hk_is_hint: bti is outside that mask and the detour
+ * this library writes leads with bti jc */
+static __nocfi bool hk_is_pad(u32 insn)
+{
+	return (insn & 0xFFFFF01F) == 0xD503201F;
+}
+
+/* br carries its register in rn, the literal loads and the moves in rd */
+static __nocfi u32 hk_stub_rn(u32 insn)
+{
+	return (insn >> 5) & 0x1F;
+}
+
+static __nocfi u32 hk_stub_rd(u32 insn)
+{
+	return insn & 0x1F;
+}
+
+/*
+ * exact stubs only. the relocation tables leave br, brk, movz and movk out, so
+ * they are spelled out here, and anything else has to stay plain: a stub that
+ * passes for a prologue is the answer a caller cannot recover from
+ */
+static __nocfi enum hk_inline_state hk_stub_state(const u32 *win,
+						  const char **reason)
+{
+	const u32 *s = win;
+	int left = HK_INLINE_ENTRY_MAX;
+	u32 rd;
+	int i;
+
+	/* the ftrace preamble, every instrumented entry carries it, and a live
+	 * one is patched to a bl that a detour would sit on top of */
+	if (win[0] == HK_INS_MOV_X9_LR) {
+		*reason = hk_insn_type(win[1]) == HK_INST_BL ?
+			  "ftrace call site at entry" : "ftrace patch site at entry";
+		return HK_INLINE_PATCHSITE;
+	}
+	if (hk_is_pad(win[0])) {
+		s++;
+		left--;
+	}
+	rd = hk_stub_rd(s[0]);
+	if (hk_is_br(s[0])) {
+		*reason = "br at entry";
+		return HK_INLINE_HOOKED;
+	}
+	if (hk_is_brk(s[0])) {
+		*reason = "brk at entry";
+		return HK_INLINE_HOOKED;
+	}
+	/* a b behind a pad the branch walk does not cross, bti is outside
+	 * hk_is_hint, so the hook would patch this entry and not its target */
+	if (hk_is_b(s[0])) {
+		*reason = "direct b at entry";
+		return HK_INLINE_BRANCHED;
+	}
+	if (hk_insn_type(s[0]) == HK_INST_LDR_64 && hk_is_br(s[1]) &&
+	    hk_stub_rn(s[1]) == rd) {
+		*reason = "ldr br stub at entry";
+		return HK_INLINE_HOOKED;
+	}
+	if ((s[0] & HK_INS_MOV_MASK) == HK_INS_MOVZ) {
+		for (i = 1; i < left; i++) {
+			if (hk_is_br(s[i]) && hk_stub_rn(s[i]) == rd) {
+				*reason = "movz br stub at entry";
+				return HK_INLINE_HOOKED;
+			}
+			if ((s[i] & HK_INS_MOV_MASK) != HK_INS_MOVK ||
+			    hk_stub_rd(s[i]) != rd)
+				break;
+		}
+	}
+	return HK_INLINE_PLAIN;
+}
+
+__nocfi int hk_inline_probe(const char *sym, struct hk_inline_probe *out)
+{
+	struct hk_relo_ctx ctx;
+	u8 raw[HK_INLINE_PATCH_LEN];
+	u32 win[HK_INLINE_ENTRY_MAX];
+	u32 scratch[HK_PROBE_SCRATCH];
+	unsigned long addr;
+	unsigned long target;
+	u32 i;
+	int ret;
+
+	if (!sym || !out)
+		return -EINVAL;
+	memset(out, 0, sizeof(*out));
+	out->patch_len = HK_INLINE_PATCH_LEN;
+	out->state = HK_INLINE_UNRESOLVED;
+	out->reason = "symbol not resolved";
+
+	addr = hk_resolve(sym);
+	if (!addr)
+		return 0;
+	if (!hk_ker_addr_ok(addr)) {
+		out->state = HK_INLINE_UNSUPPORTED;
+		out->reason = "not a kernel address";
+		return 0;
+	}
+	out->addr = addr;
+
+	if (hk_follow_branch(addr, &target)) {
+		out->state = HK_INLINE_UNREADABLE;
+		out->reason = "entry not readable";
+		return 0;
+	}
+	if (!hk_ker_addr_ok(target)) {
+		out->state = HK_INLINE_UNSUPPORTED;
+		out->reason = "not a kernel address";
+		return 0;
+	}
+	out->target = target;
+
+	if (hk_read_code(target, raw, sizeof(raw))) {
+		out->state = HK_INLINE_UNREADABLE;
+		out->reason = "entry not readable";
+		return 0;
+	}
+	for (i = 0; i < HK_INLINE_ENTRY_MAX; i++)
+		win[i] = hk_get_insn(raw + i * 4);
+
+	out->state = hk_stub_state(win, &out->reason);
+	if (out->state != HK_INLINE_PLAIN)
+		return 0;
+
+	/* dry run the relocator over the copy, scratch is never patched and
+	 * never mapped executable, only the refusal is of interest */
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.dst = scratch;
+	ctx.src = raw;
+	ctx.tramp_start = target;
+	ctx.tramp_end = target + HK_INLINE_PATCH_LEN;
+	for (i = 0; i < HK_INLINE_ENTRY_MAX; i++) {
+		ctx.inst_addr = target + i * 4;
+		ret = hk_relo_inst(&ctx, win[i]);
+		if (ret) {
+			out->state = HK_INLINE_UNSUPPORTED;
+			out->reason = "entry operand points into the patched window";
+			return 0;
+		}
+	}
+
+	if (target != addr) {
+		out->state = HK_INLINE_BRANCHED;
+		out->reason = "direct b at entry";
+		return 0;
+	}
+	out->state = HK_INLINE_PLAIN;
+	out->reason = "no branch stub found";
+	return 0;
 }
