@@ -25,18 +25,27 @@ struct hk_inline {
 };
 
 /*
- * the write into kernel text is not serialized. the patch is several instructions long,
- * its length is reported by the P3 count line at install time, so a core that executes
- * the target while the write happens can run a half written instruction stream.
+ * installs are serialized by a mutex held across trampoline allocation, relocation
+ * and the text writes, so two hooks cannot interleave and a restore cannot run inside
+ * an install. the write itself is still not atomic: the detour is several instructions
+ * long, its length is reported by the P3 count line at install time, so a core that
+ * executes the target while the write happens can run a half written instruction stream
+ * the lock takes the second writer out, not the reader
  *
  * a target that is executing during installation, a device_add style hot path, is
- * therefore not safe to hook. pick a colder function on the same path, or use the kprobe
- * entries, or split prepare from commit so the last write can run from a stop_machine
- * callback. that callback must not sleep and must not allocate, so allocation and symbol
- * resolution have to finish before it.
+ * therefore still not safe to hook. use the kprobe entries there, or split prepare from
+ * commit so the last write can run from a stop_machine callback. that callback must not
+ * sleep and must not allocate, so allocation and symbol resolution have to finish before
+ * it, which is why one lock covers them today
+ *
+ * the detour covers HK_INLINE_PATCH_LEN bytes from the entry, so a target whose symbol is
+ * shorter than that shares its window with the next function, and two hooks whose windows
+ * overlap each save and restore the other's bytes. the entry needs that much room of its
+ * own, hk_inline_probe reports the length it would write
  */
 int hk_inline_hook(struct hk_inline *h, const char *sym,
 		   const char *wrapper_sym);
+/* restore the entry, -EIO when the write fails and the hook stays live */
 int hk_inline_disable(struct hk_inline *h);
 void hk_inline_free(struct hk_inline *h);
 void hk_inline_unhook(struct hk_inline *h);

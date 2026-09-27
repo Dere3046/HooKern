@@ -87,6 +87,21 @@ through an absolute LDR X17 + RET X17 jump, so there is no ±128 MB
 range limit. h->orig points to the trampoline entry, call it from the
 wrapper to run the original function.
 
+installs are serialized by a mutex held across trampoline allocation,
+relocation and the text writes, so two hooks cannot interleave and a
+restore cannot run inside an install. the write itself is still not
+atomic with respect to a core executing the target, the lock removes
+the second writer only, so a hot path other cores run during
+installation still belongs to the kprobe entries. stop_machine is not
+used: this path allocates and resolves symbols and a stop_machine
+callback must do neither, so a prepare and commit split has to come
+before the callback can carry the last write.
+
+the detour covers HK_INLINE_PATCH_LEN bytes from the entry, so the
+entry needs that much room of its own. a shorter symbol shares its
+window with the next function and two hooks whose windows overlap each
+save and restore the other's bytes, hk_inline_probe reports the length.
+
 wrapper_sym must be a global symbol (LTO localizes static ones and
 drops the names from kallsyms). addresses come from the resolver, not
 from &func.
@@ -120,7 +135,9 @@ struct hk_inline {
 **int hk_inline_disable(struct hk_inline *h)**
 
 restore the original entry but keep the trampoline alive. use before
-waiting for in-flight calls.
+waiting for in-flight calls. runs under the same install lock. -EIO
+when the write fails, the hook stays live and the trampoline stays
+allocated, call it again.
 
 **void hk_inline_free(struct hk_inline *h)**
 
@@ -175,10 +192,17 @@ stub was found, it is not proof of an untouched prologue.
 
 **int hk_ptr_hook(void **slot, void *replacement, void **orig_out)**
 
-read the pointer at slot, replace it, record the original. -EEXIST
-when the slot is already hooked. -EFAULT when the slot cannot be
-read. -ENOSPC when the tracking table (16 slots) is full. the
-original is written to orig_out on success.
+read the pointer at slot, replace it, record the original in the
+tracking list. one lock is held across the duplicate check, the read,
+the swap and the record, so two hooks cannot interleave and lose an
+original; the swap itself is a single aligned word store, a core that
+reads the slot sees the old pointer or the new one. the list has no
+fixed capacity, the walk over the live hooks costs what the old 16 slot
+table scan did. the tracking entry is allocated, so this runs in
+process context. -EEXIST when the slot is already hooked. -EFAULT when
+the slot cannot be read. -EIO when the write fails. -ENOMEM when the
+tracking entry cannot be allocated, there is no full table any more.
+the original is written to orig_out on success.
 
 **void hk_ptr_unhook(void **slot)**
 
@@ -190,13 +214,29 @@ restore every tracked slot. called by hk_exit.
 
 ## Kprobe
 
+kprobe is the entry for a target other cores can execute during
+installation. register_kprobe arms its breakpoint under text_mutex and
+cpus_read_lock, so a hot path like device_add can be probed while the
+inline primitive must not patch it. the price is the handler contract:
+a probe observes a call, it does not replace the function, and calling
+the target from a handler re-enters the same probe. use kprobe for a
+hot target, for an entry window hk_inline_probe reports as
+HK_INLINE_PATCHSITE, an ftrace patch site the relocator would lose, and
+for a window it reports as HK_INLINE_UNSUPPORTED.
+
 **int hk_kprobe_install(struct hk_kprobe *h, const char *sym, kprobe_pre_handler_t pre)**
 
 register a kprobe on sym with the given pre handler. the resolved
 address lands in h->orig. register_kprobe and unregister_kprobe are
 resolved at runtime through `__nocfi` wrappers, some GKI builds trim
-the exports, a missing symbol fails with -ENODATA. -ENOSPC when the
-tracking table (16 slots) is full, the probe is unregistered again.
+the exports, a missing symbol fails with -ENODATA. a refused install
+logs the symbol, the kernel code and the gate that fired, and returns
+the kernel code: -EINVAL for every address gate, -ENOENT for a symbol
+that does not resolve. -ENOMEM when the tracking node cannot be
+allocated, nothing is registered then, there is no ceiling on the
+number of live probes. hk_kprobe_remove logs when the probe cannot be
+unregistered again, a probe left armed on module text is a use after
+free, and a second remove of the same hook is a no op.
 
 ```c
 struct hk_kprobe {
@@ -205,10 +245,60 @@ struct hk_kprobe {
 };
 ```
 
-**void hk_kprobe_remove(struct hk_kprobe *h)**
+**int hk_kprobe_check(const char *sym, struct hk_kprobe_report *out)**
 
-unregister and untrack. **void hk_kprobe_exit(void)** removes every
-tracked probe, called by hk_exit.
+ask the address gates of register_kprobe before an install and name the
+one that would refuse the symbol, the way hk_inline_probe judges an
+inline target. nothing is written, nothing is allocated and it does not
+sleep. 0 when the report was filled, -EINVAL on a NULL argument.
+
+```c
+struct hk_kprobe_report {
+	unsigned long addr;	/* resolver result, 0 when unresolved */
+	enum hk_kprobe_state state;
+	const char *reason;	/* static string, the caller never owns it */
+};
+
+HK_KPROBE_UNRESOLVED   the resolver did not find the symbol, addr is 0
+HK_KPROBE_UNSUPPORTED  not text, or a cfi preamble symbol
+HK_KPROBE_BLACKLISTED  kprobe_blacklist, __kprobes or noinstr text, the
+                       reason names hk_kprobe_clear_blacklist
+HK_KPROBE_PATCHSITE    a recorded ftrace call site, refused on a kernel
+                       without kprobes on ftrace, arm64 has none
+HK_KPROBE_OK           no address gate matched
+```
+
+the gates are the kprobe ones for a kretprobe too, register_kretprobe
+registers a kprobe. HK_KPROBE_OK is not a promise, an install can still
+fail on a kernel symbol the resolver cannot reach or on a tracking node
+that cannot be allocated.
+
+**handler helpers**
+
+arm64 carries the first eight arguments of a call in x0 to x7 and the
+return value in x0. hk_regs_arg and hk_regs_set_arg read and write an
+argument at an entry, hk_regs_ret and hk_regs_set_ret read and write
+the return value where a kretprobe handler runs, hk_regs_ip returns the
+pc, hk_regs_lr returns the link register, and hk_regs_skip steps the pc
+over the probed instruction for a pre handler that returns 1.
+
+the replacement idiom for a hot target is hk_regs_return, it parks the
+pc on the link register so the target returns at once with x0 as the
+result and its prologue never runs, which is as close to a wrapper as a
+probe gets:
+
+```c
+static int pre(struct kprobe *p, struct pt_regs *regs)
+{
+	hk_regs_set_ret(regs, my_device_add(hk_regs_arg(regs, 0)));
+	hk_regs_return(regs);
+	return 1;
+}
+```
+
+**void hk_kprobe_remove(struct hk_kprobe *h)** unregisters and untracks.
+**void hk_kprobe_exit(void)** removes every tracked probe, called by
+hk_exit.
 
 **int hk_kprobe_clear_blacklist(void)**
 
@@ -228,9 +318,24 @@ automatically by hk_kprobe_exit, safe to call manually before exit.
 **int hk_kretprobe_install(struct hk_kretprobe *h, const char *sym, kretprobe_handler_t handler)**
 
 register a kretprobe on sym. the handler signature is the kernel one
-(struct kretprobe_instance, struct pt_regs). register_kretprobe and
-unregister_kretprobe are runtime resolved like the kprobe ones. same
-tracking limits as kprobe.
+(struct kretprobe_instance, struct pt_regs), it runs after the target
+returned and the return value is in x0, so hk_regs_set_ret rewrites it,
+which a kprobe cannot do. the kernel writes the registers back after
+the handler. register_kretprobe and unregister_kretprobe are runtime
+resolved like the kprobe ones. the address gates are the kprobe ones,
+so hk_kprobe_check answers for a kretprobe target, and a refused
+install logs the symbol, the kernel code and the gate. installs are
+tracked in a list like the kprobe ones, no ceiling and no -ENOSPC,
+-ENOMEM when the tracking node cannot be allocated. the target has to
+return, a function that never returns leaks instances until maxactive
+runs out and the probe then misses returns instead of failing the
+install.
+
+**int hk_kretprobe_install_ex(struct hk_kretprobe *h, const char *sym, kretprobe_handler_t entry, kretprobe_handler_t handler, size_t data_size)**
+
+the entry and return pair. the entry handler runs at the call, returns
+1 to accept the instance and can fill ri->data with data_size bytes,
+which the return handler reads back from the same instance.
 
 ```c
 struct hk_kretprobe {
@@ -239,7 +344,8 @@ struct hk_kretprobe {
 ```
 
 **void hk_kretprobe_remove(struct hk_kretprobe *h)** and **void
-hk_kretprobe_exit(void)** mirror the kprobe ones.
+hk_kretprobe_exit(void)** mirror the kprobe ones, including the log line
+when the probe cannot be unregistered again.
 
 ## Binder trace
 
