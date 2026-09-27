@@ -11,6 +11,7 @@
 
 #include "hk.h"
 #include "hk_patch.h"
+#include "hk_cfi.h"
 
 #define HK_CFI_RET 0xD65F03C0
 #define HK_CFI_MOV 0xD2800020
