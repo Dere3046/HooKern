@@ -130,6 +130,47 @@ free the trampoline after disable. safe to call on a zeroed hook.
 
 disable then free.
 
+**int hk_inline_probe(const char *sym, struct hk_inline_probe *out)**
+
+read only half of hk_inline_hook, for a caller that wants to judge a
+live hot path before it is patched. it resolves sym, follows the same
+branch chain, reads the entry window through the nofault helper and
+runs the relocator over a copy of it. it writes nothing, allocates
+nothing, does not sleep and never allocates exec memory. 0 when the
+report was filled, -EINVAL on a NULL argument.
+
+```c
+struct hk_inline_probe {
+	unsigned long addr;	/* resolver result, 0 when unresolved */
+	unsigned long target;	/* entry a hook would patch, chain followed */
+	u32 patch_len;		/* bytes the detour overwrites there */
+	enum hk_inline_state state;
+	const char *reason;	/* static string, the caller never owns it */
+};
+```
+
+```
+HK_INLINE_UNRESOLVED   sym did not resolve, addr is 0
+HK_INLINE_UNREADABLE   the entry window could not be read
+HK_INLINE_UNSUPPORTED  the relocator refuses the window, an operand in it
+                       points back into the window, or addr is not a
+                       kernel address
+HK_INLINE_HOOKED       a jump stub sits in the window: br, brk, ldr plus br,
+                       or a movz movk chain ending in br
+HK_INLINE_PATCHSITE    an ftrace patch site: mov x9, x30 at the entry, with
+                       nop or bl behind it
+HK_INLINE_BRANCHED     a direct b in the entry, target is where a hook would
+                       write, the end of the chain when the walk follows it
+                       and the entry itself when it does not
+HK_INLINE_PLAIN        no known stub, the relocator accepts the window
+```
+
+every state except plain means the entry should not be patched as it
+stands. plain is signature based: an adrp add br stub, a patch that
+keeps the first instructions, and an ftrace site on a kernel whose
+ftrace patches a bare nop are not recognised, so plain means no known
+stub was found, it is not proof of an untouched prologue.
+
 ## Pointer replacement
 
 **int hk_ptr_hook(void **slot, void *replacement, void **orig_out)**
