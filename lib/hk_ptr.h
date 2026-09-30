@@ -10,10 +10,10 @@
 
 /*
  * swap the pointer at slot for replacement and record the original for
- * hk_ptr_unhook or hk_ptr_exit. one lock is held across the duplicate check, the
- * read, the swap and the record, so two hooks cannot interleave and lose an
- * original. the swap itself is a single aligned word store through the fixmap
- * alias, a core that reads the slot sees the old pointer or the new one
+ * hk_ptr_unhook or hk_ptr_exit. the duplicate check and the record are under one
+ * spinlock and the swap is not: the swap goes through the fixmap and a fixmap
+ * open sleeps, so it runs from an entry already reserved under the lock. a slot
+ * is taken from the moment it is reserved, a second hook on it is -EEXIST
  *
  * the hooks live in a list, there is no fixed capacity and no -ENOSPC. the walk
  * over the live hooks costs the same as the old table scan. the tracking entry is
@@ -29,5 +29,8 @@ void hk_ptr_unhook(void **slot);
 
 /* restore every tracked slot, called by hk_exit */
 void hk_ptr_exit(void);
+
+/* slots whose original could not be written back, counted for the exit gate */
+unsigned int hk_ptr_pending(void);
 
 #endif

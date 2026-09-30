@@ -13,6 +13,16 @@
 /* bytes the detour overwrites at the entry, the exposure hk_inline_probe reports */
 #define HK_INLINE_PATCH_LEN (HK_INLINE_ENTRY_MAX * 4)
 
+/* pages whose BTI guarded attribute is cleared for a BR X17 continuation */
+#define HK_INLINE_GUARD_MAX 8
+
+struct hk_inline_guard {
+	unsigned long page;
+	unsigned long pte;
+	bool had_gp;
+	bool active;
+};
+
 struct hk_inline {
 	const char *name;
 	unsigned long addr;
@@ -21,6 +31,10 @@ struct hk_inline {
 	size_t mem_size;
 	u32 window;
 	bool disabled;
+	bool pending;
+	bool use_br_x17;
+	struct hk_inline_guard guard[HK_INLINE_GUARD_MAX];
+	u32 guard_count;
 	u8 saved[HK_INLINE_ENTRY_MAX * 4];
 };
 
@@ -28,15 +42,14 @@ struct hk_inline {
  * installs are serialized by a mutex held across trampoline allocation, relocation
  * and the text writes, so two hooks cannot interleave and a restore cannot run inside
  * an install. the write itself is still not atomic: the detour is several instructions
- * long, its length is reported by the P3 count line at install time, so a core that
+ * long, its length is reported by the p3 count line at install time, so a core that
  * executes the target while the write happens can run a half written instruction stream
  * the lock takes the second writer out, not the reader
  *
  * a target that is executing during installation, a device_add style hot path, is
- * therefore still not safe to hook. use the kprobe entries there, or split prepare from
- * commit so the last write can run from a stop_machine callback. that callback must not
- * sleep and must not allocate, so allocation and symbol resolution have to finish before
- * it, which is why one lock covers them today
+ * therefore still not safe to hook. use the kprobe entries there. the entry window is
+ * written with one call, so a multi instruction detour is written from a stop_machine
+ * callback and only a single word goes through the direct path
  *
  * the detour covers HK_INLINE_PATCH_LEN bytes from the entry, so a target whose symbol is
  * shorter than that shares its window with the next function. the library records the
@@ -49,7 +62,17 @@ int hk_inline_hook(struct hk_inline *h, const char *sym,
  * window is released with the restore, a later install may take it */
 int hk_inline_disable(struct hk_inline *h);
 void hk_inline_free(struct hk_inline *h);
+/*
+ * the three stage unload: disable the entry, wait one RCU tasks grace period so
+ * a core that already fetched the detour is out of the trampoline, then free it.
+ * a hook whose entry could not be restored stays live and pending, and
+ * hk_inline_exit retries it
+ */
 void hk_inline_unhook(struct hk_inline *h);
+
+/* retry every pending unload, called by hk_exit and hk_exit_block */
+void hk_inline_exit(void);
+unsigned int hk_inline_pending(void);
 
 /*
  * what the entry of a probe target looks like from the outside. everything

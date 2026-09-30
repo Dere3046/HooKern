@@ -21,4 +21,14 @@ int hk_init(const struct hk_cfg *cfg);
 void hk_exit(void);
 unsigned long hk_resolve(const char *name);
 
+/*
+ * the consumers run their own exit, the library only counts the failures it was
+ * told about and keeps the numbers for the next hk_exit. a module whose exit
+ * path left kernel text pointing into module memory must not unload, so it calls
+ * hk_exit_block at the end of its own exit and never returns
+ */
+void hk_exit_fail(int count);
+unsigned int hk_exit_failed(void);
+void hk_exit_block(void);
+
 #endif

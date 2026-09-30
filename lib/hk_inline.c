@@ -9,19 +9,19 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/printk.h>
+#include <linux/rcupdate_trace.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
-#include <linux/slab.h>
 
 #include "hk.h"
 #include "hk_patch.h"
 #include "hk_inline.h"
 
 #define HK_TRAMP_SIZE 4096
-#define HK_TRAMP_MAX 64
 #define HK_INS_LDR_X17 0x58000051
 #define HK_INS_BR_X17 0xD61F0220
 #define HK_INS_RET_X17 0xD65F0220
@@ -36,6 +36,11 @@
 #define HK_INS_MOVZ 0x52800000
 #define HK_INS_MOVK 0x72800000
 #define HK_INS_MOV_X9_LR 0xAA1E03E9
+
+/* bit 50 of an arm64 pte, the BTI guarded attribute of the page */
+#define HK_PTE_GP 0x0004000000000000UL
+
+#define HK_BTI_GUARDED(_pte) ((_pte) & HK_PTE_GP)
 
 /* dry run sink for the probe, the tables allow 8 words per instruction */
 #define HK_PROBE_SCRATCH 128
@@ -57,6 +62,18 @@ struct hk_inline_own {
 };
 
 static LIST_HEAD(g_inline_owned);
+
+/*
+ * an unload that could not finish. the trampoline is still reachable from the
+ * entry, so it must not be freed, and rmmod must not be allowed to unmap it. the
+ * node is the only thing the exit gate needs to retry
+ */
+struct hk_inline_pending {
+	struct list_head list;
+	struct hk_inline *hook;
+};
+
+static LIST_HEAD(g_inline_pending);
 
 typedef enum {
 	HK_INST_B = 1,
@@ -94,8 +111,16 @@ static const u32 hk_types[] = {
 	0x00000000,
 };
 
+/*
+ * words the relocation of one instruction emits. it has to match the emitters
+ * below exactly, hk_relo_in_tramp walks these numbers to turn an address inside
+ * the patched window into the address the same instruction has in the trampoline
+ */
 static const int hk_relo_len[] = {
-	6, 8, 6, 4, 4, 5, 5, 5, 7, 7, 7, 7, 6, 6, 6, 6, 2,
+	6, 6, 6, 4, 4,
+	5, 5, 5, 7, 7, 7, 7,
+	6, 6, 6, 6,
+	2,
 };
 
 static __nocfi u32 hk_get_insn(const u8 *p)
@@ -120,15 +145,6 @@ static __nocfi u32 hk_enc_movk(u32 rd, u32 imm, u32 hw)
 	return 0xF2800000 | (hw << 21) | ((imm & 0xFFFF) << 5) | rd;
 }
 
-static __nocfi void hk_build_jump(u32 *out, unsigned long target)
-{
-	out[0] = hk_enc_movz(16, target & 0xFFFF, 0);
-	out[1] = hk_enc_movk(16, (target >> 16) & 0xFFFF, 1);
-	out[2] = hk_enc_movk(16, (target >> 32) & 0xFFFF, 2);
-	out[3] = hk_enc_movk(16, (target >> 48) & 0xFFFF, 3);
-	out[4] = HK_INS_RET_X17;
-}
-
 static bool hk_is_b(u32 insn)
 {
 	return (insn & hk_masks[0]) == hk_types[0];
@@ -144,35 +160,50 @@ static u64 hk_decode_b_target(u32 insn, u64 pc)
 	return pc + hk_sext(insn & 0x03FFFFFF, 26) * 4;
 }
 
-static u64 hk_resolve_branch_once(u64 addr)
+/* a resolver result can be stale and a b target is arithmetic, so neither the
+ * probe nor the branch walk dereferences one directly */
+static __nocfi int hk_read_code(unsigned long addr, void *dst, size_t len)
 {
-	u32 inst;
-	u32 n;
-	u64 next;
-
-	inst = hk_get_insn((const u8 *)addr);
-	if (hk_is_b(inst))
-		return hk_decode_b_target(inst, addr);
-	if (hk_is_hint(inst)) {
-		next = addr + 4;
-		n = hk_get_insn((const u8 *)next);
-
-		if (hk_is_b(n))
-			return hk_decode_b_target(n, next);
-	}
-	return addr;
+	return copy_from_kernel_nofault(dst, (const void *)addr, len);
 }
 
-static int hk_resolve_branch_chain(unsigned long addr, unsigned long *out)
+static __nocfi int hk_fetch_insn(unsigned long addr, u32 *out)
 {
+	u8 raw[4];
+
+	if (hk_read_code(addr, raw, sizeof(raw)))
+		return -EFAULT;
+	*out = hk_get_insn(raw);
+	return 0;
+}
+
+/*
+ * the entry a hook patches: a symbolic entry is often a thunk of b or of a hint
+ * followed by b, and patching the thunk leaves the real body alone. the walk
+ * reads through the nofault helper, a chain that cannot be read stops the walk
+ * and every hook that lands on an unreadable target is refused later
+ */
+static __nocfi int hk_resolve_branch_chain(unsigned long addr,
+					   unsigned long *out)
+{
+	u32 insn;
+	u32 next;
 	int depth;
 
 	for (depth = 0; depth < 32; depth++) {
-		unsigned long target = hk_resolve_branch_once(addr);
-
-		if (target == addr)
+		if (hk_fetch_insn(addr, &insn))
+			return -EFAULT;
+		if (hk_is_b(insn)) {
+			addr = hk_decode_b_target(insn, addr);
+			continue;
+		}
+		if (!hk_is_hint(insn))
 			break;
-		addr = target;
+		if (hk_fetch_insn(addr + 4, &next))
+			return -EFAULT;
+		if (!hk_is_b(next))
+			break;
+		addr = hk_decode_b_target(next, addr + 4);
 	}
 	*out = addr;
 	return 0;
@@ -209,25 +240,51 @@ static bool hk_in_tramp(const struct hk_relo_ctx *c, u64 addr)
 	return addr >= c->tramp_start && addr < c->tramp_end;
 }
 
+/*
+ * an operand that points back into the window has to point at the copy of that
+ * instruction in the trampoline after relocation, and the copy sits at the sum
+ * of the lengths of everything emitted before it
+ */
 static u64 hk_relo_in_tramp(const struct hk_relo_ctx *c, u64 addr)
 {
 	const u8 *src = c->src ? c->src : (const u8 *)c->tramp_start;
 	u64 fix = c->backup_start;
-	u32 inst;
 	u32 idx;
-	int j;
+	u32 inst;
+	u32 j;
 
 	if (!hk_in_tramp(c, addr))
 		return addr;
 	idx = (addr - c->tramp_start) / 4;
-	for (j = 0; j < (int)idx; j++) {
+	if (idx >= HK_INLINE_ENTRY_MAX)
+		return addr;
+	for (j = 0; j < idx; j++) {
 		inst = hk_get_insn(src + j * 4);
 		fix += hk_relo_len[hk_insn_index(inst)] * 4;
 	}
 	return fix;
 }
 
-static int hk_relo_abs_jump(struct hk_relo_ctx *c, u64 target)
+/*
+ * ldr x17, #8 ; b #12 ; lo ; hi ; br x17 ; nop
+ * the literal sits behind the branch so the sequence is one straight line and
+ * four words is the shortest form, the nop keeps every emission the same length
+ */
+static __nocfi int hk_relo_stub(struct hk_relo_ctx *c, u64 addr, bool wrap)
+{
+	c->dst[c->count++] = HK_INS_LDR_X17;
+	c->dst[c->count++] = 0x14000003;
+	c->dst[c->count++] = addr & 0xFFFFFFFF;
+	c->dst[c->count++] = addr >> 32;
+	if (wrap)
+		c->dst[c->count++] = HK_INS_BR_X17;
+	else
+		c->dst[c->count++] = HK_INS_RET_X17;
+	c->dst[c->count++] = HK_INS_NOP;
+	return 0;
+}
+
+static __nocfi int hk_relo_abs_jump(struct hk_relo_ctx *c, u64 target)
 {
 	c->dst[c->count++] = HK_INS_LDR_X17;
 	c->dst[c->count++] = HK_INS_RET_X17;
@@ -236,7 +293,8 @@ static int hk_relo_abs_jump(struct hk_relo_ctx *c, u64 target)
 	return 0;
 }
 
-static int hk_relo_b(struct hk_relo_ctx *c, u32 insn, hk_inst_type_t type)
+static __nocfi int hk_relo_b(struct hk_relo_ctx *c, u32 insn,
+			     hk_inst_type_t type)
 {
 	u64 disp;
 	u64 addr;
@@ -248,34 +306,45 @@ static int hk_relo_b(struct hk_relo_ctx *c, u32 insn, hk_inst_type_t type)
 	addr = c->inst_addr + disp;
 	addr = hk_relo_in_tramp(c, addr);
 
+	/*
+	 * a conditional branch has to keep its own two instruction test and land
+	 * on the stub that follows it, so it is rewritten to skip four words
+	 * instead of three
+	 */
 	if (type == HK_INST_BC) {
 		c->dst[c->count++] = (insn & 0xFF00001F) | 0x40;
 		c->dst[c->count++] = 0x14000006;
 	}
+	return hk_relo_stub(c, addr, type != HK_INST_BL);
+}
+
+static __nocfi int hk_relo_bl(struct hk_relo_ctx *c, u32 insn)
+{
+	u64 addr = c->inst_addr + hk_sext(insn & 0x03FFFFFF, 26) * 4;
+
+	addr = hk_relo_in_tramp(c, addr);
 	c->dst[c->count++] = HK_INS_LDR_X17;
-	c->dst[c->count++] = 0x14000003;
+	c->dst[c->count++] = HK_INS_BLR_X17;
 	c->dst[c->count++] = addr & 0xFFFFFFFF;
 	c->dst[c->count++] = addr >> 32;
-	if (type == HK_INST_BL)
-		c->dst[c->count++] = HK_INS_BLR_X17;
-	else
-		c->dst[c->count++] = HK_INS_RET_X17;
+	c->dst[c->count++] = HK_INS_NOP;
 	c->dst[c->count++] = HK_INS_NOP;
 	return 0;
 }
 
-static int hk_relo_adr(struct hk_relo_ctx *c, u32 insn, hk_inst_type_t type)
+static __nocfi int hk_relo_adr(struct hk_relo_ctx *c, u32 insn,
+			       hk_inst_type_t type)
 {
 	u32 xd = insn & 0x1F;
 	u64 addr;
 
-	if (type == HK_INST_ADR)
+	if (type == HK_INST_ADR) {
 		addr = c->inst_addr + hk_sext(((insn >> 5) & 0x7FFFF) |
 					      ((insn >> 29) & 0x3), 21);
-	else {
+	} else {
 		addr = (c->inst_addr & ~0xFFFUL) +
-		       hk_sext(((insn >> 5) & 0x7FFFF) << 14 |
-			       ((insn >> 29) & 0x3) << 12, 33);
+		       hk_sext((((insn >> 5) & 0x7FFFF) << 2) |
+			       ((insn >> 29) & 0x3), 21);
 		if (hk_in_tramp(c, addr))
 			return -EOPNOTSUPP;
 	}
@@ -286,7 +355,8 @@ static int hk_relo_adr(struct hk_relo_ctx *c, u32 insn, hk_inst_type_t type)
 	return 0;
 }
 
-static int hk_relo_ldr(struct hk_relo_ctx *c, u32 insn, hk_inst_type_t type)
+static __nocfi int hk_relo_ldr(struct hk_relo_ctx *c, u32 insn,
+			       hk_inst_type_t type)
 {
 	u32 rt = insn & 0x1F;
 	u64 addr = c->inst_addr + hk_sext((insn >> 5) & 0x7FFFF, 19) * 4;
@@ -313,6 +383,11 @@ static int hk_relo_ldr(struct hk_relo_ctx *c, u32 insn, hk_inst_type_t type)
 	} else {
 		u32 op;
 
+		/*
+		 * the simd and prefetch literals are read into a register the
+		 * original instruction does not name, so x16 and x17 are saved
+		 * around the load and restored after it
+		 */
 		if (type == HK_INST_PRFM)
 			op = 0xF9800220;
 		else if (type == HK_INST_LDR_SIMD_32)
@@ -325,76 +400,70 @@ static int hk_relo_ldr(struct hk_relo_ctx *c, u32 insn, hk_inst_type_t type)
 		c->dst[c->count++] = 0x58000091;
 		c->dst[c->count++] = op | rt;
 		c->dst[c->count++] = 0xF85F83F1;
-		c->dst[c->count++] = 0x14000003;
+		c->dst[c->count++] = 0x14000005;
 		c->dst[c->count++] = addr & 0xFFFFFFFF;
 		c->dst[c->count++] = addr >> 32;
 	}
 	return 0;
 }
 
-static int hk_relo_cb(struct hk_relo_ctx *c, u32 insn)
+static __nocfi int hk_relo_cb(struct hk_relo_ctx *c, u32 insn)
 {
 	u64 addr = c->inst_addr + hk_sext((insn >> 5) & 0x7FFFF, 19) * 4;
 
 	addr = hk_relo_in_tramp(c, addr);
 	c->dst[c->count++] = (insn & 0xFF00001F) | 0x40;
 	c->dst[c->count++] = 0x14000005;
-	c->dst[c->count++] = HK_INS_LDR_X17;
-	c->dst[c->count++] = HK_INS_RET_X17;
-	c->dst[c->count++] = addr & 0xFFFFFFFF;
-	c->dst[c->count++] = addr >> 32;
-	return 0;
+	return hk_relo_stub(c, addr, true);
 }
 
-static int hk_relo_tb(struct hk_relo_ctx *c, u32 insn)
+static __nocfi int hk_relo_tb(struct hk_relo_ctx *c, u32 insn)
 {
 	u64 addr = c->inst_addr + hk_sext((insn >> 5) & 0x3FFF, 14) * 4;
 
 	addr = hk_relo_in_tramp(c, addr);
 	c->dst[c->count++] = (insn & 0xFFF8001F) | 0x40;
 	c->dst[c->count++] = 0x14000005;
-	c->dst[c->count++] = HK_INS_LDR_X17;
-	c->dst[c->count++] = HK_INS_RET_X17;
-	c->dst[c->count++] = addr & 0xFFFFFFFF;
-	c->dst[c->count++] = addr >> 32;
-	return 0;
+	return hk_relo_stub(c, addr, true);
 }
 
-static int hk_relo_inst(struct hk_relo_ctx *c, u32 insn)
+static __nocfi int hk_relo_inst(struct hk_relo_ctx *c, u32 insn)
 {
-	int i = hk_insn_index(insn);
-	int ret = 0;
+	int ret;
 
-	switch (i) {
-	case 0:
-	case 1:
-	case 2:
-		ret = hk_relo_b(c, insn, i + 1);
+	switch (hk_insn_type(insn)) {
+	case HK_INST_B:
+	case HK_INST_BC:
+		ret = hk_relo_b(c, insn, hk_insn_type(insn));
 		break;
-	case 3:
-	case 4:
-		ret = hk_relo_adr(c, insn, i == 3 ? HK_INST_ADR : HK_INST_ADRP);
+	case HK_INST_BL:
+		ret = hk_relo_bl(c, insn);
 		break;
-	case 5:
-	case 6:
-	case 7:
-	case 8:
-	case 9:
-	case 10:
-	case 11:
-		ret = hk_relo_ldr(c, insn, i + 1);
+	case HK_INST_ADR:
+	case HK_INST_ADRP:
+		ret = hk_relo_adr(c, insn, hk_insn_type(insn));
 		break;
-	case 12:
-	case 13:
+	case HK_INST_LDR_32:
+	case HK_INST_LDR_64:
+	case HK_INST_LDRSW:
+	case HK_INST_PRFM:
+	case HK_INST_LDR_SIMD_32:
+	case HK_INST_LDR_SIMD_64:
+	case HK_INST_LDR_SIMD_128:
+		ret = hk_relo_ldr(c, insn, hk_insn_type(insn));
+		break;
+	case HK_INST_CBZ:
+	case HK_INST_CBNZ:
 		ret = hk_relo_cb(c, insn);
 		break;
-	case 14:
-	case 15:
+	case HK_INST_TBZ:
+	case HK_INST_TBNZ:
 		ret = hk_relo_tb(c, insn);
 		break;
 	default:
 		c->dst[c->count++] = insn;
 		c->dst[c->count++] = HK_INS_NOP;
+		ret = 0;
 		break;
 	}
 	return ret;
@@ -432,21 +501,23 @@ static __nocfi noinline void hk_exec_free(void *mem)
 	vfree(mem);
 }
 
-static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
-				   const char *wrapper_sym,
-				   unsigned long addr);
-
 /* the entry address a hook on sym patches: the resolver result with the same
  * branch chain walked, so the collision window and the probe agree */
-static __nocfi unsigned long hk_read_addr(const char *sym)
+static __nocfi int hk_read_addr(const char *sym, unsigned long *out)
 {
 	unsigned long addr;
+	int ret;
 
 	addr = hk_resolve(sym);
 	if (!addr)
-		return 0;
-	hk_resolve_branch_chain(addr, &addr);
-	return addr;
+		return -ENOENT;
+	ret = hk_resolve_branch_chain(addr, &addr);
+	if (ret)
+		return ret;
+	if (!hk_ker_addr_ok(addr))
+		return -EINVAL;
+	*out = addr;
+	return 0;
 }
 
 /* the window of another live hook that overlaps [start, start + len), NULL when
@@ -551,38 +622,93 @@ static int hk_inline_collide(const char *sym, unsigned long start, u32 len,
 	return -EBUSY;
 }
 
-__nocfi int hk_inline_hook(struct hk_inline *h, const char *sym,
-			   const char *wrapper_sym)
+/*
+ * the page table entry of a kernel virtual address. the walk is the generic one
+ * and it is handed the kernel's own init_mm, resolved at runtime because the
+ * symbol is not in the module namespace of every build. a block mapping at any
+ * level means the page has no pte this code could change, which is a refused
+ * guard rather than a written entry
+ */
+static unsigned long *hk_pte_of(unsigned long addr)
 {
-	unsigned long addr;
-	int ret;
+	struct mm_struct *mm;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
 
-	if (!h || !sym || !wrapper_sym)
-		return -EINVAL;
+	mm = (struct mm_struct *)hk_resolve("init_mm");
+	if (!mm || !hk_ker_addr_ok((unsigned long)mm))
+		return NULL;
+	pgd = pgd_offset(mm, addr);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return NULL;
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return NULL;
+	pud = pud_offset(p4d, addr);
+	if (pud_none(*pud) || pud_bad(*pud))
+		return NULL;
+	pmd = pmd_offset(pud, addr);
+	if (pmd_none(*pmd) || pmd_bad(*pmd))
+		return NULL;
+	return (unsigned long *)pte_offset_kernel(pmd, addr);
+}
 
-	/*
-	 * one lock across trampoline allocation, relocation and both text
-	 * writes, so two installs cannot interleave their trampolines or their
-	 * entry windows. the write itself is still a burst of instructions and
-	 * a core that executes the target right now can see half of it, the
-	 * lock only takes the second writer out of the picture
-	 *
-	 * stop_machine is not used around this path. only the last write could
-	 * run from a callback, and a stop_machine callback must neither sleep
-	 * nor allocate while this path allocates the trampoline and resolves
-	 * symbols. the split has to come first: prepare under this lock, then
-	 * commit the detour from a callback that does neither
-	 */
-	addr = hk_read_addr(sym);
-	ret = hk_inline_own(h, sym, addr, HK_INLINE_PATCH_LEN);
-	if (ret)
-		return ret;
-	mutex_lock(&g_inline_lock);
-	ret = hk_inline_apply(h, sym, wrapper_sym, addr);
-	mutex_unlock(&g_inline_lock);
-	if (ret)
-		hk_inline_release(h);
-	return ret;
+/*
+ * the continuation of every relocated branch is an indirect branch, and an
+ * indirect branch into a page whose pte carries the guarded attribute traps
+ * unless the first instruction is a bti landing pad. the resumption points are
+ * the instructions after the patched window, which are not landing pads, so the
+ * attribute is cleared for exactly the pages that hold one and recorded for the
+ * free path to put back. the attribute is not cleared on the entry page, a
+ * caller that reaches the entry indirectly needs the landing pad there
+ */
+static int hk_bti_guard_track(struct hk_inline *h, unsigned long addr)
+{
+	struct hk_inline_guard *guard;
+	unsigned long page = addr & PAGE_MASK;
+	unsigned long *ptep;
+	unsigned long pte;
+	u32 i;
+
+	for (i = 0; i < h->guard_count; i++) {
+		if (h->guard[i].page == page)
+			return 0;
+	}
+	if (h->guard_count >= HK_INLINE_GUARD_MAX)
+		return -ENOSPC;
+	ptep = hk_pte_of(page);
+	if (!ptep)
+		return -EFAULT;
+	pte = READ_ONCE(*ptep);
+	if (!HK_BTI_GUARDED(pte))
+		return 0;
+
+	guard = &h->guard[h->guard_count++];
+	guard->page = page;
+	guard->pte = pte;
+	guard->had_gp = true;
+	guard->active = true;
+	WRITE_ONCE(*ptep, pte & ~HK_PTE_GP);
+	dsb(ish);
+	return 0;
+}
+
+static void hk_bti_guard_restore(struct hk_inline *h)
+{
+	unsigned long *ptep;
+	u32 i;
+
+	for (i = 0; i < h->guard_count; i++) {
+		if (!h->guard[i].active)
+			continue;
+		ptep = (unsigned long *)h->guard[i].pte;
+		WRITE_ONCE(*ptep, h->guard[i].pte);
+		dsb(ish);
+		h->guard[i].active = false;
+	}
+	h->guard_count = 0;
 }
 
 static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
@@ -593,8 +719,8 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	u32 detour[HK_INLINE_ENTRY_MAX];
 	unsigned long wrapper;
 	unsigned long mem;
+	u32 saved[HK_INLINE_ENTRY_MAX];
 	u32 i;
-	u32 insn;
 	int ret;
 
 	memset(h, 0, sizeof(*h));
@@ -602,23 +728,38 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	if (!tramp)
 		return -ENOMEM;
 
-	if (!addr) {
-		pr_warn("[lkmhook] inline resolve %s failed\n", sym);
-		return -ENODATA;
-	}
 	wrapper = hk_resolve(wrapper_sym);
-	if (!wrapper) {
+	if (!wrapper || !hk_ker_addr_ok(wrapper)) {
 		pr_warn("[lkmhook] inline resolve %s failed\n", wrapper_sym);
-		return -ENODATA;
+		ret = -ENODATA;
+		goto err_free;
 	}
-	pr_info("[lkmhook] P1 addr=0x%lx\n", addr);
-	if (!hk_ker_addr_ok(addr))
-		return -EINVAL;
+
+	/*
+	 * the window is read once through the nofault helper and every later step
+	 * uses the copy, the entry can be restored to its own bytes by a failed
+	 * install after this point and the relocation must not read the patched
+	 * text again
+	 */
+	for (i = 0; i < HK_INLINE_ENTRY_MAX; i++) {
+		ret = hk_fetch_insn(addr + i * 4, &saved[i]);
+		if (ret) {
+			pr_warn("[lkmhook] inline %s entry is not readable\n",
+				sym);
+			ret = -EFAULT;
+			goto err_free;
+		}
+		h->saved[i * 4] = saved[i] & 0xFF;
+		h->saved[i * 4 + 1] = (saved[i] >> 8) & 0xFF;
+		h->saved[i * 4 + 2] = (saved[i] >> 16) & 0xFF;
+		h->saved[i * 4 + 3] = (saved[i] >> 24) & 0xFF;
+	}
 
 	mem = (unsigned long)hk_exec_alloc(HK_TRAMP_SIZE);
 	if (!mem) {
 		pr_warn("[lkmhook] inline exec alloc %s failed\n", sym);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto err_free;
 	}
 	h->mem = (void *)mem;
 	h->mem_size = HK_TRAMP_SIZE;
@@ -632,40 +773,50 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	tramp[3] = wrapper & 0xFFFFFFFF;
 	tramp[4] = wrapper >> 32;
 	tramp[5] = HK_INS_BTI_JC;
-	pr_info("[lkmhook] P2 mem=0x%lx wrapper=0x%lx\n", mem, wrapper);
 
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.dst = tramp + 6;
+	ctx.src = h->saved;
 	ctx.tramp_start = addr;
 	ctx.tramp_end = addr + HK_INLINE_PATCH_LEN;
 	ctx.backup_start = mem + 24;
 
 	for (i = 0; i < HK_INLINE_ENTRY_MAX; i++) {
-		insn = hk_get_insn((const u8 *)(addr + i * 4));
-
-		h->saved[i * 4] = insn & 0xFF;
-		h->saved[i * 4 + 1] = (insn >> 8) & 0xFF;
-		h->saved[i * 4 + 2] = (insn >> 16) & 0xFF;
-		h->saved[i * 4 + 3] = (insn >> 24) & 0xFF;
 		ctx.inst_addr = addr + i * 4;
-		ret = hk_relo_inst(&ctx, insn);
-		if (ret)
-			goto err_free;
+		ret = hk_relo_inst(&ctx, saved[i]);
+		if (ret) {
+			pr_warn("[lkmhook] inline relo %s insn %u refused %d\n",
+				sym, i, ret);
+			goto err_guard;
+		}
 	}
-	pr_info("[lkmhook] P3 count=%u\n", ctx.count);
-	ctx.inst_addr = addr + HK_INLINE_PATCH_LEN;
-	ret = hk_relo_abs_jump(&ctx, addr + HK_INLINE_PATCH_LEN);
-	if (ret)
-		goto err_free;
 
-	ret = hk_patch_text((void *)mem, tramp,
-			     ctx.count * 4 + 24,
-			     HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE);
+	/*
+	 * the continuation is the instruction after the window. it is reached with
+	 * an indirect branch, so the page is guarded and the landing pad rule
+	 * applies: br x17 stays when the attribute can be cleared, otherwise ret
+	 * x17 is used, which is a return and has no landing pad requirement
+	 */
+	ctx.inst_addr = addr + HK_INLINE_PATCH_LEN;
+	h->use_br_x17 = true;
+	if (hk_bti_guard_track(h, addr + HK_INLINE_PATCH_LEN))
+		h->use_br_x17 = false;
+	ret = hk_relo_stub(&ctx, addr + HK_INLINE_PATCH_LEN, h->use_br_x17);
 	if (ret)
-		goto err_free;
+		goto err_guard;
+
+	ret = hk_patch_text((void *)mem, tramp, ctx.count * 4 + 24,
+			    HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE);
+	if (ret)
+		goto err_guard;
 
 	h->orig = mem + 20;
 
+	/*
+	 * the detour is written in one call, so a multi instruction window goes
+	 * through stop_machine: no core is running while the entry changes from
+	 * the caller's bytes to bti jc plus an absolute jump
+	 */
 	detour[0] = HK_INS_BTI_JC;
 	detour[1] = HK_INS_LDR_X17;
 	detour[2] = HK_INS_RET_X17;
@@ -676,17 +827,51 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	if (ret) {
 		hk_patch_text((void *)addr, h->saved, HK_INLINE_PATCH_LEN,
 			      HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE);
-		goto err_free;
+		goto err_guard;
 	}
 
 	kfree(tramp);
+	pr_info("[lkmhook] inline %s addr=0x%lx tramp=0x%lx words=%u br_x17=%u\n",
+		sym, addr, mem, ctx.count, h->use_br_x17 ? 1 : 0);
 	return 0;
 
-err_free:
-	kfree(tramp);
+err_guard:
+	hk_bti_guard_restore(h);
 	hk_exec_free(h->mem);
 	h->mem = NULL;
 	pr_warn("[lkmhook] inline %s failed %d\n", sym, ret);
+err_free:
+	kfree(tramp);
+	return ret;
+}
+
+__nocfi int hk_inline_hook(struct hk_inline *h, const char *sym,
+			   const char *wrapper_sym)
+{
+	unsigned long addr = 0;
+	int ret;
+
+	if (!h || !sym || !wrapper_sym)
+		return -EINVAL;
+
+	/*
+	 * one lock across trampoline allocation, relocation and both text
+	 * writes, so two installs cannot interleave their trampolines or their
+	 * entry windows, and no trampoline is freed under a reader
+	 */
+	ret = hk_read_addr(sym, &addr);
+	if (ret) {
+		pr_warn("[lkmhook] inline resolve %s failed %d\n", sym, ret);
+		return -ENODATA;
+	}
+	ret = hk_inline_own(h, sym, addr, HK_INLINE_PATCH_LEN);
+	if (ret)
+		return ret;
+	mutex_lock(&g_inline_lock);
+	ret = hk_inline_apply(h, sym, wrapper_sym, addr);
+	mutex_unlock(&g_inline_lock);
+	if (ret)
+		hk_inline_release(h);
 	return ret;
 }
 
@@ -715,6 +900,11 @@ int hk_inline_disable(struct hk_inline *h)
 	return 0;
 }
 
+/*
+ * free the trampoline. the entry must be the caller's bytes again and the
+ * guarded pages go back to what they were. a hook that never reached disable is
+ * refused, its detour is still the entry
+ */
 void hk_inline_free(struct hk_inline *h)
 {
 	mutex_lock(&g_inline_lock);
@@ -727,6 +917,7 @@ void hk_inline_free(struct hk_inline *h)
 		pr_warn("[lkmhook] inline free before disable\n");
 		return;
 	}
+	hk_bti_guard_restore(h);
 	if (h->mem)
 		hk_exec_free(h->mem);
 	h->addr = 0;
@@ -744,55 +935,128 @@ void hk_inline_free(struct hk_inline *h)
 	hk_inline_release(h);
 }
 
+typedef void (*hk_synchronize_rcu_tasks_fn)(void);
+
+static __nocfi void hk_inline_synchronize_rcu_tasks(void)
+{
+	hk_synchronize_rcu_tasks_fn fn;
+	unsigned long sym = hk_resolve("synchronize_rcu_tasks");
+
+	if (!sym || !hk_ker_addr_ok(sym)) {
+		pr_warn_once("[lkmhook] synchronize_rcu_tasks not found, a freed trampoline may still be running\n");
+		return;
+	}
+	fn = (hk_synchronize_rcu_tasks_fn)sym;
+	fn();
+}
+
+static void hk_inline_pending_add(struct hk_inline *h)
+{
+	struct hk_inline_pending *ent;
+
+	mutex_lock(&g_inline_lock);
+	list_for_each_entry(ent, &g_inline_pending, list) {
+		if (ent->hook == h) {
+			mutex_unlock(&g_inline_lock);
+			return;
+		}
+	}
+	ent = kzalloc(sizeof(*ent), GFP_KERNEL);
+	if (!ent) {
+		mutex_unlock(&g_inline_lock);
+		return;
+	}
+	ent->hook = h;
+	list_add(&ent->list, &g_inline_pending);
+	mutex_unlock(&g_inline_lock);
+}
+
+static void hk_inline_pending_del(struct hk_inline *h)
+{
+	struct hk_inline_pending *ent;
+
+	mutex_lock(&g_inline_lock);
+	list_for_each_entry(ent, &g_inline_pending, list) {
+		if (ent->hook != h)
+			continue;
+		list_del(&ent->list);
+		mutex_unlock(&g_inline_lock);
+		kfree(ent);
+		return;
+	}
+	mutex_unlock(&g_inline_lock);
+}
+
+/*
+ * the three stage unload. disable first, so no core can fetch the detour again.
+ * then one tasks RCU grace period, which is what waits for a core that already
+ * fetched the detour and is inside the trampoline, the kernel uses the same
+ * flavour for its own text pokes. the free comes last, after both. a hook whose
+ * entry could not be restored stays live and pending for hk_inline_exit
+ */
 void hk_inline_unhook(struct hk_inline *h)
 {
 	if (!h)
 		return;
-	hk_inline_disable(h);
+	if (hk_inline_disable(h)) {
+		h->pending = true;
+		hk_inline_pending_add(h);
+		pr_warn("[lkmhook] inline unhook %s parked, the entry is still patched\n",
+			h->name ? h->name : "?");
+		return;
+	}
+	hk_inline_synchronize_rcu_tasks();
 	hk_inline_free(h);
+	h->pending = false;
+	hk_inline_pending_del(h);
 }
 
-/* a resolver result can be stale and a b target is arithmetic, so the probe
- * never dereferences a target directly */
-static __nocfi int hk_read_code(unsigned long addr, void *dst, size_t len)
+unsigned int hk_inline_pending(void)
 {
-	return copy_from_kernel_nofault(dst, (const void *)addr, len);
+	unsigned int count = 0;
+	struct hk_inline_pending *ent;
+
+	mutex_lock(&g_inline_lock);
+	list_for_each_entry(ent, &g_inline_pending, list)
+		count++;
+	mutex_unlock(&g_inline_lock);
+	return count;
 }
 
-static __nocfi int hk_fetch_insn(unsigned long addr, u32 *out)
+void hk_inline_exit(void)
 {
-	u8 raw[4];
+	struct hk_inline_pending *ent;
+	struct hk_inline_pending *tmp;
+	LIST_HEAD(work);
 
-	if (hk_read_code(addr, raw, sizeof(raw)))
-		return -EFAULT;
-	*out = hk_get_insn(raw);
-	return 0;
+	mutex_lock(&g_inline_lock);
+	list_splice_init(&g_inline_pending, &work);
+	mutex_unlock(&g_inline_lock);
+
+	list_for_each_entry_safe(ent, tmp, &work, list) {
+		list_del(&ent->list);
+		if (hk_inline_disable(ent->hook)) {
+			pr_warn("[lkmhook] inline %s still patched\n",
+				ent->hook->name ? ent->hook->name : "?");
+			list_add(&ent->list, &work);
+			continue;
+		}
+		hk_inline_synchronize_rcu_tasks();
+		hk_inline_free(ent->hook);
+		ent->hook->pending = false;
+		kfree(ent);
+	}
+
+	mutex_lock(&g_inline_lock);
+	list_splice_tail(&work, &g_inline_pending);
+	mutex_unlock(&g_inline_lock);
 }
 
 /* the same walk as hk_resolve_branch_chain, which reads the target directly.
  * a thunk is a supported hook target, here it is a report */
 static __nocfi int hk_follow_branch(unsigned long addr, unsigned long *out)
 {
-	u32 insn;
-	int depth;
-
-	for (depth = 0; depth < 32; depth++) {
-		if (hk_fetch_insn(addr, &insn))
-			return -EFAULT;
-		if (hk_is_b(insn)) {
-			addr = hk_decode_b_target(insn, addr);
-			continue;
-		}
-		if (!hk_is_hint(insn))
-			break;
-		if (hk_fetch_insn(addr + 4, &insn))
-			return -EFAULT;
-		if (!hk_is_b(insn))
-			break;
-		addr = hk_decode_b_target(insn, addr + 4);
-	}
-	*out = addr;
-	return 0;
+	return hk_resolve_branch_chain(addr, out);
 }
 
 static __nocfi bool hk_is_br(u32 insn)
