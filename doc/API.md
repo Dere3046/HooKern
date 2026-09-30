@@ -120,6 +120,30 @@ unsigned int slot)** and **int hk_patch_write_at(void *dst, unsigned long
 val, int flags)** are the explicit forms; the plain calls above are the
 same with the slot from the flags word or 0.
 
+the mode field of the flags word picks the write path:
+`HK_PATCH_FLAGS_MODE(HK_PATCH_MODE_SLOT)` opens a fixmap slot of this
+build and stores through the alias, `HK_PATCH_FLAGS_MODE(HK_PATCH_MODE_INSN_PATCH)`
+calls the kernel's own aarch64_insn_patch_text and assumes nothing about
+this build, `HK_PATCH_FLAGS_MODE(HK_PATCH_MODE_INSN_WRITE)` calls
+aarch64_insn_write for one instruction. slot 0 is the default and is the
+only path that needs the fixmap frame of the running kernel to be the one
+the headers describe.
+
+**enum hk_slot_policy hk_patch_slot_policy(void)** and **void
+hk_patch_set_slot_policy(enum hk_slot_policy policy)** decide what a
+refused alias does. `HK_SLOT_POLICY_FALLBACK` (default) falls back to the
+kernel primitive and retires the slot path for the module,
+`HK_SLOT_POLICY_RETRY` falls back for that write only and keeps trying,
+`HK_SLOT_POLICY_FORCE` stores through the alias whatever the page table
+says, `HK_SLOT_POLICY_OFF` never opens a slot.
+
+**enum hk_slot_check hk_patch_slot_check(void)** and **void
+hk_patch_set_slot_check(enum hk_slot_check check)** pick the test the
+alias is judged by. `HK_SLOT_CHECK_FRAME` (default) requires the entry to
+be present and to name the frame the write asked for, which is what a
+vendor poison descriptor fails, `HK_SLOT_CHECK_PRESENT` is the historical
+present test. both settings are process wide and are read at every write.
+
 **int hk_patch_prepare(struct hk_patch_set *set, struct hk_patch_hook *hook)**
 
 the precheck of a transaction. nothing is written: the destination is

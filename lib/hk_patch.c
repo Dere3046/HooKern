@@ -50,6 +50,7 @@ typedef struct vm_struct *(*find_vm_area_fn)(const void *addr);
  * at all and every caller is documented as process context
  */
 static DEFINE_MUTEX(g_patch_lock);
+static enum hk_slot_check g_slot_check = HK_SLOT_CHECK_FRAME;
 
 static clean_inval_fn g_clean_inval;
 static fixmap_fn g_set_fixmap;
@@ -176,14 +177,28 @@ static unsigned long *hk_dst_pte(unsigned long addr)
  * store faults instead of failing. this is the gate that turns that into an
  * error the caller can act on
  */
-static int hk_patch_dst_check(unsigned long va, int idx, unsigned long caller)
+static int hk_patch_dst_check(unsigned long va, int idx, unsigned long caller,
+			      unsigned long want)
 {
 	unsigned long *ptep = hk_dst_pte(va);
+	unsigned long pte;
 
-	if (ptep && pte_present(__pte(READ_ONCE(*ptep))))
-		return 0;
+	if (ptep) {
+		pte = READ_ONCE(*ptep);
+		/*
+		 * present is not enough. a vendor kernel can prefill an unused
+		 * fixmap entry with a poison descriptor whose present bit is set
+		 * and whose output address is a frame that does not exist, and
+		 * the store then faults inside the translation instead of failing
+		 * here. only the frame that was asked for proves the alias
+		 */
+		if (pte_present(__pte(pte)) &&
+		    (g_slot_check == HK_SLOT_CHECK_PRESENT ||
+		     __pte_to_phys(__pte(pte)) == (want & PAGE_MASK)))
+			return 0;
+	}
 #if HK_PATCH_DST_CHECK
-	pr_warn("[lkmhook] fixmap %d dest 0x%lx is not a mapped page, caller 0x%lx, refused\n",
+	pr_warn("[lkmhook] fixmap %d dest 0x%lx is not the frame asked for, caller 0x%lx, refused\n",
 		idx, va, caller);
 #endif
 	return -ENXIO;
@@ -194,8 +209,43 @@ static int hk_patch_dst_check(unsigned long va, int idx, unsigned long caller)
  * first refusal takes the slot path out for good. every later write goes straight
  * to the kernel's own primitive, whose frame is the kernel's
  */
+static enum hk_slot_policy g_slot_policy = HK_SLOT_POLICY_FALLBACK;
+
+enum hk_slot_check hk_patch_slot_check(void)
+{
+	return g_slot_check;
+}
+
+void hk_patch_set_slot_check(enum hk_slot_check check)
+{
+	if (check > HK_SLOT_CHECK_PRESENT)
+		return;
+	g_slot_check = check;
+}
+
+enum hk_slot_policy hk_patch_slot_policy(void)
+{
+	return g_slot_policy;
+}
+
+void hk_patch_set_slot_policy(enum hk_slot_policy policy)
+{
+	if (policy > HK_SLOT_POLICY_OFF)
+		return;
+	if (policy != HK_SLOT_POLICY_FALLBACK)
+		g_slot_broken = false;
+	g_slot_policy = policy;
+}
+
 static void hk_slot_disable(const char *why)
 {
+	/*
+	 * only the fallback policy retires the path. a caller that asked for
+	 * retry keeps it, one that asked for force never reaches a refusal, and
+	 * one that turned the path off never opened it
+	 */
+	if (g_slot_policy != HK_SLOT_POLICY_FALLBACK)
+		return;
 	if (g_slot_broken)
 		return;
 	g_slot_broken = true;
@@ -356,13 +406,27 @@ static int hk_patch_slot_run(unsigned long addr, const void *src, size_t len,
 		ret = hk_translate(addr, &phys);
 		if (ret)
 			break;
+		/*
+		 * a frame the kernel does not own must never reach the alias, so
+		 * it is refused before the slot is opened
+		 */
+		if (g_slot_policy != HK_SLOT_POLICY_FORCE &&
+		    !pfn_valid(phys >> PAGE_SHIFT)) {
+			pr_warn("[lkmhook] 0x%lx resolves to a frame outside memory, refused\n",
+				addr);
+			ret = -EFAULT;
+			break;
+		}
 		chunk = min(left, PAGE_SIZE - (phys & ~PAGE_MASK));
 
 		ret = call_set_fixmap(idx, phys & PAGE_MASK, PAGE_KERNEL);
 		if (ret)
 			break;
 		fixmap_va = __fix_to_virt(idx) + (phys & ~PAGE_MASK);
-		ret = hk_patch_dst_check(fixmap_va, idx, caller);
+		if (g_slot_policy == HK_SLOT_POLICY_FORCE)
+			ret = 0;
+		else
+			ret = hk_patch_dst_check(fixmap_va, idx, caller, phys);
 		if (ret) {
 			call_set_fixmap(idx, 0, __pgprot(0));
 			break;
@@ -597,7 +661,18 @@ int hk_patch_text_at(void *dst, const void *src, size_t len, int flags,
 	 * on a kernel whose VA_BITS is not the one this module was built with,
 	 * which is exactly the case the slot path cannot survive
 	 */
-	if (mode == HK_PATCH_MODE_SLOT && hk_is_module_addr(addr))
+	/*
+	 * a module or vmalloc address has a page table the kernel's own patch
+	 * primitive already reaches, and its entries are the ones a vendor
+	 * kernel is most likely to mark in a way this walk cannot judge, so
+	 * those addresses never take the slot path. the image and the linear map
+	 * keep it, and the module lookup is only a hint: the range test stands on
+	 * its own when that symbol is missing
+	 */
+	if (mode == HK_PATCH_MODE_SLOT &&
+	    (g_slot_policy == HK_SLOT_POLICY_OFF ||
+	     hk_is_module_addr(addr) ||
+	     (!hk_kernel_image_addr(addr) && !__is_lm_address(addr))))
 		mode = HK_PATCH_MODE_INSN_PATCH;
 
 	if (mode == HK_PATCH_MODE_INSN_PATCH) {
