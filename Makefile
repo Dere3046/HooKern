@@ -1,7 +1,8 @@
 obj-m := lkmhook.o
 
 lkmhook-y := src/main.o lib/hk.o lib/hk_ksym.o lib/hk_patch.o lib/hk_flush.o lib/hk_ptr.o \
-	lib/hk_inline.o lib/hk_kprobe.o lib/hk_kretprobe.o lib/hk_cfi.o lib/hk_binder.o \
+	lib/hk_inline.o lib/hk_kprobe.o lib/hk_kretprobe.o lib/hk_sighook.o \
+	lib/hk_cfi.o lib/hk_binder.o \
 	deps/KallRecon/lib/core.o deps/KallRecon/lib/slide.o deps/KallRecon/lib/anchor.o
 
 ifeq ($(HK_LSM),1)
@@ -26,10 +27,11 @@ $(info -- MDIR: $(MDIR))
 $(info -- ODIR: $(ODIR))
 
 all:
-	make -C $(KDIR) M=$(ODIR) src=$(MDIR) modules
+	mkdir -p $(ODIR)
+	make -C $(KDIR) M=$(ODIR) src=$(MDIR) srcroot=$(MDIR) modules
 
 clean:
-	make -C $(KDIR) M=$(ODIR) src=$(MDIR) clean
+	make -C $(KDIR) M=$(ODIR) src=$(MDIR) srcroot=$(MDIR) clean
 
 $(obj)/%.o: $(src)/%.c $(recordmcount_source) FORCE
 	$(call if_changed_rule,cc_o_c)

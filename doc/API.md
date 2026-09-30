@@ -35,7 +35,20 @@ clears state. safe to call multiple times.
 
 **unsigned long hk_resolve(const char *name)**
 
-query through the injected resolver. 0 when unset or unresolved.
+query through the injected resolver. 0 when unset or unresolved. when
+the injected resolver has nothing, or the library is between `hk_exit`
+and the next `hk_init`, the kernel symbol table is walked once for a
+`name$type` entry, which is what a clang CFI build calls the body of a
+function whose address was taken, and that body is returned.
+
+**void hk_exit_block(void)**
+
+the end of a module's exit path, for a module whose kernel text still
+branches into a hook. it never returns while a hook is live: it retries
+`hk_inline_exit` and `hk_ptr_exit` every 60 seconds and only returns
+once every count is zero. rmmod unmaps module text and data as soon as
+the exit path returns, so a live detour without this points into freed
+memory.
 
 ## Symbols
 
@@ -56,25 +69,85 @@ struct hk_sym {
 
 ## Patch
 
-writes to read-only kernel memory through the fixmap slot. the target
+writes to read-only kernel memory through a fixmap slot. the target
 virtual address is translated without any self-written page table
 walk: kernel image addresses (inside `_text`/`_end`, resolved lazily)
-use `kimage_voffset` (VA_BITS independent), everything else goes
-through the kernel's exported `vmalloc_to_pfn` (module vmalloc
-memory). FIX_TEXT_POKE0 is mapped to the page with PAGE_KERNEL and
-the bytes are written through the fixmap alias.
+use `kimage_voffset` (VA_BITS independent), a linear mapping uses
+`__pa`, and the vmalloc window goes through the kernel's exported
+`vmalloc_to_pfn` (module vmalloc memory) after `find_vm_area` says the
+address is a registered area, where that symbol exists. an address
+that matches no path is refused with a code instead of being handed to
+a walk that would read a block mapping as a page table.
+
+the slot named by a call is an index into the early ioremap window:
+slot 0 is `FIX_BTMAP_END`, which is `__end_of_permanent_fixed_addresses`
+in every build of this series, so the numbering starts above the
+permanent part and can never reach `FIX_TEXT_POKE0`, the kernel's own
+patch slot, or `FIX_ENTRY_TRAMP_TEXT1` to `TEXT4`, where the KPTI entry
+trampoline is mapped. slots 0 to `HK_PATCH_SLOT_LIMIT - 1` (8) are
+accepted, anything else is -EINVAL before `__set_fixmap` runs, whose
+own guard is a `BUG_ON`. a write opens one slot, stores and unmaps it
+again, and the unmapping is on the only path that mapped it.
+
+the flags word carries the slot in bits 16 to 23 and the write mode in
+bits 8 to 15, both 0 by default. modes are `HK_PATCH_MODE_SLOT` (0,
+the library slot, one instruction directly and several from a
+stop_machine callback), `HK_PATCH_MODE_INSN_PATCH` (1, the kernel's
+`aarch64_insn_patch_text` under `cpus_read_lock`, which is a
+`stop_machine_cpuslocked` wrapper and asserts the lock is held, up to
+`HK_PATCH_INSNS_MAX` instructions) and `HK_PATCH_MODE_INSN_WRITE` (2,
+the kernel's `aarch64_insn_write`, one word at a time, caller flushes).
+every mode is process context, the calls sleep.
 
 **int hk_patch_write(void *dst, unsigned long val)**
 
-write a single word under a spinlock. the fast path for pointer
-replacement. -EIO when the address cannot be translated.
+write a single word. the fast path for pointer replacement. -EINVAL on
+a bad argument, -ENOENT when a symbol the path needs is absent, -EIO
+when the address matches no translation path, -EFAULT when the page
+cannot be reached.
 
 **int hk_patch_text(void *dst, const void *src, size_t len, int flags)**
 
-write any length under a spinlock with per-page fixmap mapping. flags
-are HK_PATCH_FLUSH_ICACHE and HK_PATCH_FLUSH_DCACHE. no
-stop_machine: on 5.10 old CFI its indirect call BR's into the module
-cfi_jt stub (bti c entry) which trips BTI on guarded module pages.
+write any length, per page fixmap mapping, one instruction directly and
+any longer run from a stop_machine callback. flags are
+`HK_PATCH_FLUSH_ICACHE`, `HK_PATCH_FLUSH_DCACHE`, a mode and a slot.
+`len` must be a multiple of four. failures are returned, never
+swallowed: -EINVAL, -ENOENT, -EIO, -EFAULT and -E2BIG for a kernel mode
+run over `HK_PATCH_INSNS_MAX` words.
+
+**int hk_patch_text_at(void *dst, const void *src, size_t len, int flags,
+unsigned int slot)** and **int hk_patch_write_at(void *dst, unsigned long
+val, int flags)** are the explicit forms; the plain calls above are the
+same with the slot from the flags word or 0.
+
+**int hk_patch_prepare(struct hk_patch_set *set, struct hk_patch_hook *hook)**
+
+the precheck of a transaction. nothing is written: the destination is
+translated, the current bytes are read through the nofault helper into
+`hook->orig` and checksummed into `hook->checksum`, and the hook joins
+the set. -EALREADY on a hook prepared twice, -EINVAL on a bad argument
+or a length over `HK_PATCH_INSNS_MAX` words, and the translation codes
+above. both structs are caller owned.
+
+**int hk_patch_commit(struct hk_patch_set *set)**
+
+every site is compared against the bytes the prepare saw before the
+first write, so a site another writer took is -EAGAIN with nothing
+changed. a write that fails after that point puts the sites already
+written back, so a set is all in or all out, and the failing code is
+returned.
+
+**int hk_patch_rollback(struct hk_patch_set *set)**
+
+restore the sites the set has active. the first failure is returned, a
+hook that could not be restored stays active for a later call.
+**void hk_patch_set_init(struct hk_patch_set *set)** and **void
+hk_patch_set_release(struct hk_patch_set *set)** start and empty a set,
+release does not write, and **unsigned int hk_patch_set_count(const
+struct hk_patch_set *set)** counts the hooks in it.
+
+the hook set is what a hot replacement is built on: prepare every new
+hook, commit the set, then unhook the old ones.
 
 ## Inline hook
 
@@ -83,7 +156,7 @@ cfi_jt stub (bti c entry) which trips BTI on guarded module pages.
 
 replace the entry of sym with a 20 byte detour and build an internal
 exec trampoline. the wrapper is resolved from wrapper_sym and invoked
-through an absolute LDR X17 + RET X17 jump, so there is no ±128 MB
+through an absolute LDR X17 + RET X17 jump, so there is no plus or minus 128 MB
 range limit. h->orig points to the trampoline entry, call it from the
 wrapper to run the original function.
 
@@ -132,9 +205,21 @@ struct hk_inline {
 	size_t mem_size;
 	u32 window;
 	bool disabled;
+	bool pending;
+	bool use_br_x17;
+	struct hk_inline_guard guard[HK_INLINE_GUARD_MAX];
+	u32 guard_count;
 	u8 saved[HK_INLINE_ENTRY_MAX * 4];
 };
 ```
+
+the continuation after the patched window is reached with an indirect
+branch, so the pages that hold one and carry the guarded attribute have
+it cleared for the install and put back when the trampoline is freed,
+recorded in `guard` and counted by `guard_count`. when the attribute
+cannot be cleared the continuation uses `RET X17` instead of `BR X17`,
+which is a return and needs no landing pad, and `use_br_x17` reports
+which of the two is in the trampoline.
 
 **int hk_inline_disable(struct hk_inline *h)**
 
@@ -151,7 +236,12 @@ on a zeroed hook.
 
 **void hk_inline_unhook(struct hk_inline *h)**
 
-disable then free.
+the three stage unload: disable the entry, wait one `synchronize_rcu_tasks`
+grace period so a core that already fetched the detour is out of the
+trampoline, then free it. a hook whose entry could not be restored is
+parked, the trampoline is kept and `hk_inline_pending` counts it, and
+`hk_inline_exit` retries every parked hook. that count is what
+`hk_exit_block` gates the module exit on.
 
 **int hk_inline_probe(const char *sym, struct hk_inline_probe *out)**
 

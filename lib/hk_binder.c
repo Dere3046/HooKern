@@ -21,6 +21,17 @@
 #include "hk_cfi.h"
 #include "hk_inline.h"
 
+long __nocfi hk_binder_ioctl_wrap(struct file *filp, unsigned int cmd,
+				  unsigned long arg);
+unsigned long __nocfi hk_binder_copy_wrap(void *alloc, void *buffer,
+					  unsigned long buffer_offset,
+					  const void __user *from,
+					  size_t bytes);
+void __nocfi hk_binder_transaction_wrap(void *proc, void *thread,
+					struct binder_transaction_data *tr,
+					int reply,
+					unsigned long extra_buffers_size);
+
 typedef long (*binder_ioctl_fn)(struct file *filp, unsigned int cmd,
 				unsigned long arg);
 typedef unsigned long (*binder_copy_fn)(void *alloc, void *buffer,

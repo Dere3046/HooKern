@@ -129,6 +129,13 @@ static void __exit lkmhook_exit(void)
 	hk_kprobe_remove(&demo_kp);
 	hk_exit();
 	pr_info("[lkmhook] ptr restored by exit %d\n", demo_fn(21));
+
+	/*
+	 * a hook whose restore failed still has its detour in kernel text, so the
+	 * module must not unmap the trampoline it points at. the gate returns only
+	 * once everything is back
+	 */
+	hk_exit_block();
 	pr_info("[lkmhook] unloaded\n");
 }
 
