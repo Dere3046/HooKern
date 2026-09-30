@@ -117,9 +117,9 @@ static const u32 hk_types[] = {
  * the patched window into the address the same instruction has in the trampoline
  */
 static const int hk_relo_len[] = {
-	6, 6, 6, 4, 4,
+	6, 8, 6, 4, 4,
 	5, 5, 5, 7, 7, 7, 7,
-	6, 6, 6, 6,
+	8, 8, 8, 8,
 	2,
 };
 
@@ -399,8 +399,8 @@ static __nocfi int hk_relo_ldr(struct hk_relo_ctx *c, u32 insn,
 		c->dst[c->count++] = 0xA93F47F0;
 		c->dst[c->count++] = 0x58000091;
 		c->dst[c->count++] = op | rt;
-		c->dst[c->count++] = 0xF85F83F1;
-		c->dst[c->count++] = 0x14000005;
+		c->dst[c->count++] = 0xA8C147F0;
+		c->dst[c->count++] = 0x14000003;
 		c->dst[c->count++] = addr & 0xFFFFFFFF;
 		c->dst[c->count++] = addr >> 32;
 	}
@@ -413,7 +413,7 @@ static __nocfi int hk_relo_cb(struct hk_relo_ctx *c, u32 insn)
 
 	addr = hk_relo_in_tramp(c, addr);
 	c->dst[c->count++] = (insn & 0xFF00001F) | 0x40;
-	c->dst[c->count++] = 0x14000005;
+	c->dst[c->count++] = 0x14000006;
 	return hk_relo_stub(c, addr, true);
 }
 
@@ -423,7 +423,7 @@ static __nocfi int hk_relo_tb(struct hk_relo_ctx *c, u32 insn)
 
 	addr = hk_relo_in_tramp(c, addr);
 	c->dst[c->count++] = (insn & 0xFFF8001F) | 0x40;
-	c->dst[c->count++] = 0x14000005;
+	c->dst[c->count++] = 0x14000006;
 	return hk_relo_stub(c, addr, true);
 }
 
