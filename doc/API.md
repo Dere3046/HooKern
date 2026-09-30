@@ -125,9 +125,18 @@ the mode field of the flags word picks the write path:
 build and stores through the alias, `HK_PATCH_FLAGS_MODE(HK_PATCH_MODE_INSN_PATCH)`
 calls the kernel's own aarch64_insn_patch_text and assumes nothing about
 this build, `HK_PATCH_FLAGS_MODE(HK_PATCH_MODE_INSN_WRITE)` calls
-aarch64_insn_write for one instruction. slot 0 is the default and is the
-only path that needs the fixmap frame of the running kernel to be the one
-the headers describe.
+aarch64_insn_write for one instruction, and
+`HK_PATCH_FLAGS_MODE(HK_PATCH_MODE_FIXMAP)` writes byte wide through
+FIX_TEXT_POKE0, the slot the kernel's own patcher uses, which is the index
+a vendor kernel is least likely to have moved. slot 0 is the default and
+is the only path that needs the fixmap frame of the running kernel to be
+the one the headers describe.
+
+**bool hk_patch_slot_direct(void)** and **void
+hk_patch_set_slot_direct(bool on)** decide whether a target whose own entry
+is already writable is written in place, no alias opened. on by default,
+which is what the kernel's own patch_map does when the strict rwx configs
+are off.
 
 **enum hk_slot_policy hk_patch_slot_policy(void)** and **void
 hk_patch_set_slot_policy(enum hk_slot_policy policy)** decide what a
@@ -142,7 +151,14 @@ hk_patch_set_slot_check(enum hk_slot_check check)** pick the test the
 alias is judged by. `HK_SLOT_CHECK_FRAME` (default) requires the entry to
 be present and to name the frame the write asked for, which is what a
 vendor poison descriptor fails, `HK_SLOT_CHECK_PRESENT` is the historical
-present test. both settings are process wide and are read at every write.
+present test, `HK_SLOT_CHECK_NONE` skips the test and the page table read
+with it. both settings are process wide and are read at every write.
+
+**int hk_patch_symbols_init(void)** resolves every symbol the write paths
+need, in process context, and is called from hk_init. the wrappers resolve
+lazily when it was not called, and a lazy resolve can land inside
+stop_machine where the kallsyms walk may not sleep. returns the number of
+optional symbols that are missing.
 
 **int hk_patch_prepare(struct hk_patch_set *set, struct hk_patch_hook *hook)**
 

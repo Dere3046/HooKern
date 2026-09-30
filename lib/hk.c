@@ -14,6 +14,7 @@
 #include "hk_kretprobe.h"
 #include "hk_sighook.h"
 #include "hk_inline.h"
+#include "hk_patch.h"
 
 static struct hk_cfg g_cfg;
 static bool g_exiting;
@@ -99,6 +100,11 @@ int hk_init(const struct hk_cfg *cfg)
 
 	g_cfg = *cfg;
 	g_exiting = false;
+	/*
+	 * resolve the write path symbols here and not on first use: a lazy resolve
+	 * inside stop_machine would walk kallsyms from an atomic context
+	 */
+	hk_patch_symbols_init();
 	pr_info("[lkmhook] init\n");
 	return 0;
 }

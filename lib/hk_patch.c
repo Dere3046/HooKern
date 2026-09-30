@@ -41,7 +41,8 @@ typedef void (*clean_inval_fn)(unsigned long start, unsigned long end);
 typedef void (*fixmap_fn)(unsigned long idx, phys_addr_t phys, pgprot_t prot);
 typedef int (*insn_write_fn)(void *addr, u32 insn);
 typedef int (*insn_patch_fn)(void *addr[], u32 insn[], int count);
-typedef struct vm_struct *(*find_vm_area_fn)(const void *addr);
+typedef struct page *(*vmalloc_to_page_fn)(const void *addr);
+typedef int (*core_kernel_text_fn)(unsigned long addr);
 
 /*
  * one mutex covers the whole path because the paths sleep: __set_fixmap flushes
@@ -51,19 +52,111 @@ typedef struct vm_struct *(*find_vm_area_fn)(const void *addr);
  */
 static DEFINE_MUTEX(g_patch_lock);
 static enum hk_slot_check g_slot_check = HK_SLOT_CHECK_FRAME;
+static bool g_slot_direct = true;
+static vmalloc_to_page_fn g_vmalloc_to_page;
+static core_kernel_text_fn g_core_kernel_text;
+
+bool hk_patch_slot_direct(void)
+{
+	return g_slot_direct;
+}
+
+void hk_patch_set_slot_direct(bool on)
+{
+	g_slot_direct = on;
+}
+
+static unsigned long *hk_dst_pte(unsigned long addr);
+static bool hk_kernel_image_addr(unsigned long addr);
+
+/*
+ * the kernel's own is_image_text, asked of the kernel when the symbol is there
+ * and answered by our own range test when it is not. core_kernel_text covers
+ * the text of the image and the init text, which is exactly what the kernel
+ * translates arithmetically
+ */
+static bool hk_image_text(unsigned long addr)
+{
+	if (g_core_kernel_text)
+		return g_core_kernel_text(addr) != 0;
+	return hk_kernel_image_addr(addr);
+}
+
+/*
+ * the target's own entry decides whether the alias is needed at all. a page the
+ * kernel already maps writable is written in place, exactly like patch_map does
+ * when the strict rwx configs are off
+ */
+static bool hk_direct_write_ok(unsigned long addr)
+{
+	unsigned long *ptep;
+	unsigned long pte;
+
+	if (!g_slot_direct)
+		return false;
+	ptep = hk_dst_pte(addr);
+	if (!ptep)
+		return false;
+	pte = READ_ONCE(*ptep);
+	return pte_present(__pte(pte)) && pte_write(__pte(pte));
+}
 
 static clean_inval_fn g_clean_inval;
 static fixmap_fn g_set_fixmap;
 static insn_write_fn g_insn_write;
 static insn_patch_fn g_insn_patch;
-static find_vm_area_fn g_find_vm_area;
-static unsigned long (*g_vmalloc_to_pfn_fn)(const void *addr);
-static unsigned long g_kimage_voffset;
-static bool g_kimage_voffset_read;
 static unsigned long g_image_start;
 static unsigned long g_image_end;
 static bool g_image_read;
 static bool g_slot_broken;
+
+int hk_patch_symbols_init(void)
+{
+	unsigned long fn;
+	int missing = 0;
+
+	fn = hk_resolve("__set_fixmap");
+	if (fn && hk_ker_addr_ok(fn))
+		g_set_fixmap = (fixmap_fn)fn;
+	else
+		missing++;
+
+	fn = hk_resolve("caches_clean_inval_pou");
+	if (!fn)
+		fn = hk_resolve("dcache_clean_inval_poc");
+	if (!fn)
+		fn = hk_resolve("__flush_icache_range");
+	if (fn && hk_ker_addr_ok(fn))
+		g_clean_inval = (clean_inval_fn)fn;
+	else
+		missing++;
+
+	fn = hk_resolve("aarch64_insn_write");
+	if (fn && hk_ker_addr_ok(fn))
+		g_insn_write = (insn_write_fn)fn;
+	else
+		missing++;
+
+	fn = hk_resolve("aarch64_insn_patch_text");
+	if (fn && hk_ker_addr_ok(fn))
+		g_insn_patch = (insn_patch_fn)fn;
+	else
+		missing++;
+
+	/*
+	 * the two the slot path needs are optional on their own: the image and
+	 * the linear map are translated arithmetically and never ask for them
+	 */
+	fn = hk_resolve("vmalloc_to_page");
+	if (fn && hk_ker_addr_ok(fn))
+		g_vmalloc_to_page = (vmalloc_to_page_fn)fn;
+	fn = hk_resolve("core_kernel_text");
+	if (fn && hk_ker_addr_ok(fn))
+		g_core_kernel_text = (core_kernel_text_fn)fn;
+
+	pr_info("[lkmhook] patch symbols ready, %d optional missing\n", missing);
+	return missing;
+}
 
 /*
  * the index is an enum constant plus 0 to 7, so it folds at compile time and the
@@ -180,9 +273,13 @@ static unsigned long *hk_dst_pte(unsigned long addr)
 static int hk_patch_dst_check(unsigned long va, int idx, unsigned long caller,
 			      unsigned long want)
 {
-	unsigned long *ptep = hk_dst_pte(va);
+	unsigned long *ptep;
 	unsigned long pte;
 
+	if (g_slot_check == HK_SLOT_CHECK_NONE)
+		return 0;
+
+	ptep = hk_dst_pte(va);
 	if (ptep) {
 		pte = READ_ONCE(*ptep);
 		/*
@@ -295,46 +392,19 @@ static bool hk_kernel_image_addr(unsigned long addr)
  */
 static __nocfi noinline int hk_translate(unsigned long addr, unsigned long *out)
 {
-	unsigned long fn;
-	unsigned long phys;
-	unsigned long pfn;
-	unsigned long voff;
-	bool image;
+	struct page *page;
 
 	/*
-	 * the order matters. the image range is asked first because it is the one
-	 * test that needs a symbol, and a caller that names an address no path can
-	 * reach gets -EIO with no walk attempted, so a runaway value cannot reach
-	 * vmalloc_to_pfn and come back with a physical address built from whatever
-	 * the pmd entry it read happened to hold
+	 * the same decision the kernel's own patch_map makes: an image address is
+	 * translated arithmetically so no page table is read for it, and every
+	 * other address is asked of vmalloc_to_page, which is the kernel's own
+	 * walk and therefore behaves on a vendor marked or poisoned entry exactly
+	 * as the kernel itself does. the linear map keeps an arithmetic path of
+	 * its own, that is one walk less than the kernel takes and it is where the
+	 * tables this library patches live
 	 */
-	image = hk_kernel_image_addr(addr);
-	if (!image && !__is_lm_address(addr) && !is_vmalloc_addr((void *)addr)) {
-		pr_warn("[lkmhook] 0x%lx is not a kernel address this build can reach\n",
-			addr);
-		return -EIO;
-	}
-
-	if (image) {
-		if (!g_kimage_voffset_read) {
-			fn = hk_resolve("kimage_voffset");
-			if (!fn || !hk_ker_addr_ok(fn)) {
-				pr_warn("[lkmhook] kimage_voffset not found, image addresses cannot be translated\n");
-				return -ENOENT;
-			}
-			if (copy_from_kernel_nofault(&voff, (void *)fn,
-						     sizeof(voff))) {
-				pr_warn("[lkmhook] kimage_voffset unreadable\n");
-				return -EFAULT;
-			}
-			g_kimage_voffset = voff;
-			g_kimage_voffset_read = true;
-		}
-		if (!g_kimage_voffset) {
-			pr_warn("[lkmhook] kimage_voffset is zero\n");
-			return -EINVAL;
-		}
-		*out = addr - g_kimage_voffset;
+	if (hk_image_text(addr)) {
+		*out = __pa_symbol((void *)addr);
 		return 0;
 	}
 
@@ -343,31 +413,19 @@ static __nocfi noinline int hk_translate(unsigned long addr, unsigned long *out)
 		return 0;
 	}
 
-	if (!g_find_vm_area) {
-		fn = hk_resolve("find_vm_area");
-		if (fn && hk_ker_addr_ok(fn))
-			g_find_vm_area = (find_vm_area_fn)fn;
+	if (!g_vmalloc_to_page) {
+		pr_warn("[lkmhook] vmalloc_to_page not found, the write is refused\n");
+		return -ENOENT;
 	}
-	if (g_find_vm_area && !g_find_vm_area((const void *)addr)) {
-		pr_warn("[lkmhook] 0x%lx is not a registered vmalloc area\n",
+
+	page = g_vmalloc_to_page((const void *)addr);
+	if (!page) {
+		pr_warn("[lkmhook] 0x%lx is not an address this kernel maps for patching\n",
 			addr);
-		return -EIO;
-	}
-	if (!g_vmalloc_to_pfn_fn) {
-		fn = hk_resolve("vmalloc_to_pfn");
-		if (!fn || !hk_ker_addr_ok(fn)) {
-			pr_warn("[lkmhook] vmalloc_to_pfn not found, the write is refused\n");
-			return -ENOENT;
-		}
-		g_vmalloc_to_pfn_fn = (unsigned long (*)(const void *))fn;
-	}
-	pfn = g_vmalloc_to_pfn_fn((const void *)addr);
-	if (!pfn) {
-		pr_warn("[lkmhook] 0x%lx has no page\n", addr);
 		return -EFAULT;
 	}
-	phys = (pfn << PAGE_SHIFT) + (addr & ~PAGE_MASK);
-	*out = phys;
+
+	*out = page_to_phys(page) + (addr & ~PAGE_MASK);
 	return 0;
 }
 
@@ -400,40 +458,56 @@ static int hk_patch_slot_run(unsigned long addr, const void *src, size_t len,
 
 	while (left) {
 		unsigned long phys;
-		unsigned long fixmap_va;
+		unsigned long dst;
 		size_t chunk;
+		bool opened = false;
 
-		ret = hk_translate(addr, &phys);
-		if (ret)
-			break;
 		/*
-		 * a frame the kernel does not own must never reach the alias, so
-		 * it is refused before the slot is opened
+		 * a page the kernel already maps writable is written where it is,
+		 * which is what the kernel's own patch_map does when the strict
+		 * rwx configs are off. no fixmap entry is trusted for that write
 		 */
-		if (g_slot_policy != HK_SLOT_POLICY_FORCE &&
-		    !pfn_valid(phys >> PAGE_SHIFT)) {
-			pr_warn("[lkmhook] 0x%lx resolves to a frame outside memory, refused\n",
-				addr);
-			ret = -EFAULT;
-			break;
-		}
-		chunk = min(left, PAGE_SIZE - (phys & ~PAGE_MASK));
+		if (hk_direct_write_ok(addr)) {
+			dst = addr;
+			chunk = min(left, PAGE_SIZE - (addr & ~PAGE_MASK));
+		} else {
+			ret = hk_translate(addr, &phys);
+			if (ret)
+				break;
+			/*
+			 * a frame the kernel does not own must never reach the
+			 * alias, so it is refused before the slot is opened
+			 */
+			if (g_slot_policy != HK_SLOT_POLICY_FORCE &&
+			    !pfn_valid(phys >> PAGE_SHIFT)) {
+				pr_warn("[lkmhook] 0x%lx resolves to a frame outside memory, refused\n",
+					addr);
+				ret = -EFAULT;
+				break;
+			}
+			chunk = min(left, PAGE_SIZE - (phys & ~PAGE_MASK));
 
-		ret = call_set_fixmap(idx, phys & PAGE_MASK, PAGE_KERNEL);
-		if (ret)
-			break;
-		fixmap_va = __fix_to_virt(idx) + (phys & ~PAGE_MASK);
-		if (g_slot_policy == HK_SLOT_POLICY_FORCE)
-			ret = 0;
-		else
-			ret = hk_patch_dst_check(fixmap_va, idx, caller, phys);
-		if (ret) {
-			call_set_fixmap(idx, 0, __pgprot(0));
-			break;
+			ret = call_set_fixmap(idx, phys & PAGE_MASK,
+					      PAGE_KERNEL);
+			if (ret)
+				break;
+			dst = __fix_to_virt(idx) + (phys & ~PAGE_MASK);
+			if (g_slot_policy == HK_SLOT_POLICY_FORCE)
+				ret = 0;
+			else
+				ret = hk_patch_dst_check(dst, idx, caller,
+							 phys);
+			if (ret) {
+				call_set_fixmap(idx, 0, __pgprot(0));
+				break;
+			}
+			opened = true;
 		}
-		memcpy((void *)fixmap_va, src, chunk);
+
+		memcpy((void *)dst, src, chunk);
 		dsb(ish);
-		call_set_fixmap(idx, 0, __pgprot(0));
+		if (opened)
+			call_set_fixmap(idx, 0, __pgprot(0));
 
 		if (flags & HK_PATCH_FLUSH_DCACHE) {
 			ret = call_clean_inval(addr, addr + chunk);
@@ -632,11 +706,23 @@ int hk_patch_text_at(void *dst, const void *src, size_t len, int flags,
 		return -EINVAL;
 	if (slot > HK_PATCH_SLOT_MASK)
 		return -EINVAL;
-	if (mode > HK_PATCH_MODE_INSN_WRITE)
+	if (mode > HK_PATCH_MODE_FIXMAP)
 		return -EINVAL;
 
 	mutex_lock(&g_patch_lock);
-	ret = hk_patch_slot_index(slot, &job.idx);
+	if (mode == HK_PATCH_MODE_FIXMAP) {
+		/*
+		 * the kernel's own text poke slot, kept in the enum of this build.
+		 * __set_fixmap maps the address this index computes and the frame
+		 * check below refuses the write when that address does not carry
+		 * the frame that was asked for, so a vendor kernel that moved the
+		 * entry is a refused write and not a corrupt one
+		 */
+		job.idx = (int)FIX_TEXT_POKE0;
+		ret = 0;
+	} else {
+		ret = hk_patch_slot_index(slot, &job.idx);
+	}
 	if (ret) {
 		pr_warn("[lkmhook] fixmap slot %u is not usable, %d\n", slot,
 			ret);
@@ -651,7 +737,7 @@ int hk_patch_text_at(void *dst, const void *src, size_t len, int flags,
 	job.done = 0;
 	job.ret = 0;
 
-	if (g_slot_broken && mode != HK_PATCH_MODE_INSN_PATCH)
+	if (g_slot_broken && mode == HK_PATCH_MODE_SLOT)
 		mode = HK_PATCH_MODE_INSN_PATCH;
 
 	/*
@@ -683,7 +769,8 @@ int hk_patch_text_at(void *dst, const void *src, size_t len, int flags,
 		ret = hk_patch_slot_run(addr, src, len, flags, job.idx,
 					caller);
 		if (ret == -ENXIO) {
-			hk_slot_disable("the alias is outside the running kernel fixmap window");
+			if (mode == HK_PATCH_MODE_SLOT)
+				hk_slot_disable("the alias is outside the running kernel fixmap window");
 			ret = hk_insn_patch_run(addr, src, len);
 		}
 	} else {
@@ -698,7 +785,8 @@ int hk_patch_text_at(void *dst, const void *src, size_t len, int flags,
 		 * write path left that still has the right frame
 		 */
 		if (ret == -ENXIO) {
-			hk_slot_disable("the alias is outside the running kernel fixmap window");
+			if (mode == HK_PATCH_MODE_SLOT)
+				hk_slot_disable("the alias is outside the running kernel fixmap window");
 			ret = hk_insn_patch_run(saved.addr, saved.src,
 						saved.len);
 		}

@@ -61,6 +61,14 @@
 #define HK_PATCH_MODE_SLOT 0
 #define HK_PATCH_MODE_INSN_PATCH 1
 #define HK_PATCH_MODE_INSN_WRITE 2
+/*
+ * the slot the kernel's own patch_map uses, FIX_TEXT_POKE0, taken by this
+ * library instead of by the kernel. it is the index a vendor kernel is least
+ * likely to have moved, the write is byte wide like the slot mode, and the
+ * frame check still guards it, which the kernel's own patcher does not do.
+ * KernelSU writes through this same slot
+ */
+#define HK_PATCH_MODE_FIXMAP 3
 
 #define HK_PATCH_FLAGS_MODE(m) (((m) & HK_PATCH_MODE_MASK) << HK_PATCH_MODE_SHIFT)
 #define HK_PATCH_FLAGS_SLOT(s) (((s) & HK_PATCH_SLOT_MASK) << HK_PATCH_SLOT_SHIFT)
@@ -101,10 +109,32 @@ enum hk_slot_check {
 	HK_SLOT_CHECK_FRAME = 0,
 	/* present is enough, the historical test */
 	HK_SLOT_CHECK_PRESENT = 1,
+	/* no test at all: the alias is stored through whatever the entry says and
+	 * the page table is not even read. the caller takes the risk */
+	HK_SLOT_CHECK_NONE = 2,
 };
 
 enum hk_slot_check hk_patch_slot_check(void);
 void hk_patch_set_slot_check(enum hk_slot_check check);
+
+/*
+ * a target whose own page table entry is already writable is written through
+ * the address it was given, which is what the kernel's own patch_map does when
+ * the strict rwx configs are off. the alias is then never opened, so no fixmap
+ * entry is trusted for that write. default on, set to off to always go through
+ * the alias
+ */
+bool hk_patch_slot_direct(void);
+void hk_patch_set_slot_direct(bool on);
+
+/*
+ * resolve every symbol the write paths need, in process context. the wrappers
+ * below resolve lazily when this was not called, and a lazy resolve can happen
+ * inside stop_machine, where the kallsyms walk is not allowed to sleep. call it
+ * once from the module init path. returns 0 when the required ones are there and
+ * the number of optional ones that are missing
+ */
+int hk_patch_symbols_init(void);
 
 #define HK_PATCH_INSNS_MAX 32
 
