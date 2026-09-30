@@ -41,9 +41,70 @@
  */
 #define HK_PATCH_SLOT_LIMIT 8
 
+/*
+ * the three write paths, chosen per call through the mode field of the flags
+ * word. the caller decides, the library only reports what a path did.
+ *
+ * HK_PATCH_MODE_SLOT opens one fixmap slot of this build and stores through the
+ * alias. it is the shortest path and it is correct on every kernel whose fixmap
+ * frame is the one the headers of this build describe. a vendor kernel may move
+ * that frame or prefill an unused slot entry with a descriptor whose present bit
+ * is set and whose frame does not exist, and the alias then faults inside the
+ * store. the policy below says what happens when the alias is refused.
+ *
+ * HK_PATCH_MODE_INSN_PATCH is the kernel's own aarch64_insn_patch_text, which
+ * parks the cores, walks patch_map and uses the kernel's own FIX_TEXT_POKE0.
+ * it assumes nothing about this build and is the path KernelSU takes.
+ *
+ * HK_PATCH_MODE_INSN_WRITE is the kernel's aarch64_insn_write, one instruction.
+ */
 #define HK_PATCH_MODE_SLOT 0
 #define HK_PATCH_MODE_INSN_PATCH 1
 #define HK_PATCH_MODE_INSN_WRITE 2
+
+#define HK_PATCH_FLAGS_MODE(m) (((m) & HK_PATCH_MODE_MASK) << HK_PATCH_MODE_SHIFT)
+#define HK_PATCH_FLAGS_SLOT(s) (((s) & HK_PATCH_SLOT_MASK) << HK_PATCH_SLOT_SHIFT)
+
+/*
+ * what a refused alias does. the alias is refused when the page table entry of
+ * the slot is not the frame the write asked for, which is what a moved fixmap
+ * frame or a vendor poison descriptor looks like.
+ */
+enum hk_slot_policy {
+	/* a refusal falls back to the kernel primitive and the slot path stays
+	 * off for the rest of the module's life. default */
+	HK_SLOT_POLICY_FALLBACK = 0,
+	/* a refusal falls back for this write only, a later write tries the
+	 * slot path again */
+	HK_SLOT_POLICY_RETRY = 1,
+	/* the alias is stored through whatever the page table says, the frame
+	 * test and the memory range test are both skipped. a poison descriptor
+	 * faults in the store, which is the caller's choice to risk */
+	HK_SLOT_POLICY_FORCE = 2,
+	/* the slot path is never entered, every write takes the kernel
+	 * primitive */
+	HK_SLOT_POLICY_OFF = 3,
+};
+
+enum hk_slot_policy hk_patch_slot_policy(void);
+void hk_patch_set_slot_policy(enum hk_slot_policy policy);
+
+/*
+ * how the alias is judged before the store. both tests answer whether the alias
+ * may be stored through, they differ in what they accept. the frame test is the
+ * one that catches a vendor poison descriptor or a slot the kernel remapped to a
+ * frame of its own, the present test is the historical behaviour and accepts any
+ * entry the page table calls present. pick the one the kernel at hand needs
+ */
+enum hk_slot_check {
+	/* present and mapped to the frame the write asked for. default */
+	HK_SLOT_CHECK_FRAME = 0,
+	/* present is enough, the historical test */
+	HK_SLOT_CHECK_PRESENT = 1,
+};
+
+enum hk_slot_check hk_patch_slot_check(void);
+void hk_patch_set_slot_check(enum hk_slot_check check);
 
 #define HK_PATCH_INSNS_MAX 32
 
