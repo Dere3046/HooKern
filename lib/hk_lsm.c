@@ -113,8 +113,7 @@ static int hk_lsm_patch_slot(void **slot, void *value)
 	void *patched = value;
 	int ret;
 
-	ret = hk_patch_text(slot, &patched, sizeof(patched),
-			    HK_PATCH_FLUSH_DCACHE);
+	ret = hk_write_text(slot, &patched, sizeof(patched));
 	if (!ret)
 		smp_wmb();
 	return ret;

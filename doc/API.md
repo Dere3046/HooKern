@@ -69,96 +69,48 @@ struct hk_sym {
 
 ## Patch
 
-writes to read-only kernel memory through a fixmap slot. the target
-virtual address is translated without any self-written page table
-walk: kernel image addresses (inside `_text`/`_end`, resolved lazily)
-use `kimage_voffset` (VA_BITS independent), a linear mapping uses
-`__pa`, and the vmalloc window goes through the kernel's exported
-`vmalloc_to_pfn` (module vmalloc memory) after `find_vm_area` says the
-address is a registered area, where that symbol exists. an address
-that matches no path is refused with a code instead of being handed to
-a walk that would read a block mapping as a page table.
+writing kernel text. a call names the mechanism it wants, the library keeps no
+state about which one is right, and a fallback, a retry or a test before the
+write is written by the caller:
 
-the slot named by a call is an index into the early ioremap window:
-slot 0 is `FIX_BTMAP_END`, which is `__end_of_permanent_fixed_addresses`
-in every build of this series, so the numbering starts above the
-permanent part and can never reach `FIX_TEXT_POKE0`, the kernel's own
-patch slot, or `FIX_ENTRY_TRAMP_TEXT1` to `TEXT4`, where the KPTI entry
-trampoline is mapped. slots 0 to `HK_PATCH_SLOT_LIMIT - 1` (8) are
-accepted, anything else is -EINVAL before `__set_fixmap` runs, whose
-own guard is a `BUG_ON`. a write opens one slot, stores and unmaps it
-again, and the unmapping is on the only path that mapped it.
+**int hk_write_kernel(void *dst, const void *src, size_t len)** calls the
+kernel's own aarch64_insn_patch_text under cpus_read_lock, up to
+`HK_PATCH_INSNS_MAX` instructions. it parks the cores and maps through the
+kernel's own frame, so it assumes nothing about the headers this module was
+built with.
 
-the flags word carries the slot in bits 16 to 23 and the write mode in
-bits 8 to 15, both 0 by default. modes are `HK_PATCH_MODE_SLOT` (0,
-the library slot, one instruction directly and several from a
-stop_machine callback), `HK_PATCH_MODE_INSN_PATCH` (1, the kernel's
-`aarch64_insn_patch_text` under `cpus_read_lock`, which is a
-`stop_machine_cpuslocked` wrapper and asserts the lock is held, up to
-`HK_PATCH_INSNS_MAX` instructions) and `HK_PATCH_MODE_INSN_WRITE` (2,
-the kernel's `aarch64_insn_write`, one word at a time, caller flushes).
-every mode is process context, the calls sleep.
+**int hk_write_fixmap(void *dst, const void *src, size_t len)** writes byte
+wide, per page, through a slot this build maps itself, and checks before the
+store that the slot carries the frame that was asked for. **int
+hk_write_fixmap_raw(...)** is the same write without that check.
 
-**int hk_patch_write(void *dst, unsigned long val)**
+**int hk_write_direct(void *dst, const void *src, size_t len)** stores where
+the kernel already mapped the page writable. **bool hk_va_writable(unsigned
+long va)** answers whether that is the case, and the library does not repeat
+the test.
 
-write a single word. the fast path for pointer replacement. -EINVAL on
-a bad argument, -ENOENT when a symbol the path needs is absent, -EIO
-when the address matches no translation path, -EFAULT when the page
-cannot be reached.
+**int hk_write_one(void *dst, u32 insn)** writes one instruction through
+aarch64_insn_write and is the only path that may be called from an atomic
+context.
 
-**int hk_patch_text(void *dst, const void *src, size_t len, int flags)**
+**int hk_write_text(void *dst, const void *src, size_t len)** is the path
+hk_init was configured with, `struct hk_cfg.write`, or the kernel primitive
+when that is NULL. every write inside the library, and the calls below, take
+this one.
 
-write any length, per page fixmap mapping, one instruction directly and
-any longer run from a stop_machine callback. flags are
-`HK_PATCH_FLUSH_ICACHE`, `HK_PATCH_FLUSH_DCACHE`, a mode and a slot.
-`len` must be a multiple of four. failures are returned, never
-swallowed: -EINVAL, -ENOENT, -EIO, -EFAULT and -E2BIG for a kernel mode
-run over `HK_PATCH_INSNS_MAX` words.
+every primitive cleans the data cache over the range and invalidates the
+instruction cache, leaves nothing mapped on any path including the failing
+ones, and returns 0 or a negative errno. all of them are process context, the
+calls sleep.
 
-**int hk_patch_text_at(void *dst, const void *src, size_t len, int flags,
-unsigned int slot)** and **int hk_patch_write_at(void *dst, unsigned long
-val, int flags)** are the explicit forms; the plain calls above are the
-same with the slot from the flags word or 0.
+**unsigned long hk_va_to_pa(unsigned long va)** translates an address, 0 when
+it cannot be translated, and **bool hk_va_maps(unsigned long va, unsigned long
+pa)** answers whether an address carries a frame.
 
-the mode field of the flags word picks the write path:
-`HK_PATCH_FLAGS_MODE(HK_PATCH_MODE_SLOT)` opens a fixmap slot of this
-build and stores through the alias, `HK_PATCH_FLAGS_MODE(HK_PATCH_MODE_INSN_PATCH)`
-calls the kernel's own aarch64_insn_patch_text and assumes nothing about
-this build, `HK_PATCH_FLAGS_MODE(HK_PATCH_MODE_INSN_WRITE)` calls
-aarch64_insn_write for one instruction, and
-`HK_PATCH_FLAGS_MODE(HK_PATCH_MODE_FIXMAP)` writes byte wide through
-FIX_TEXT_POKE0, the slot the kernel's own patcher uses, which is the index
-a vendor kernel is least likely to have moved. slot 0 is the default and
-is the only path that needs the fixmap frame of the running kernel to be
-the one the headers describe.
-
-**bool hk_patch_slot_direct(void)** and **void
-hk_patch_set_slot_direct(bool on)** decide whether a target whose own entry
-is already writable is written in place, no alias opened. on by default,
-which is what the kernel's own patch_map does when the strict rwx configs
-are off.
-
-**enum hk_slot_policy hk_patch_slot_policy(void)** and **void
-hk_patch_set_slot_policy(enum hk_slot_policy policy)** decide what a
-refused alias does. `HK_SLOT_POLICY_FALLBACK` (default) falls back to the
-kernel primitive and retires the slot path for the module,
-`HK_SLOT_POLICY_RETRY` falls back for that write only and keeps trying,
-`HK_SLOT_POLICY_FORCE` stores through the alias whatever the page table
-says, `HK_SLOT_POLICY_OFF` never opens a slot.
-
-**enum hk_slot_check hk_patch_slot_check(void)** and **void
-hk_patch_set_slot_check(enum hk_slot_check check)** pick the test the
-alias is judged by. `HK_SLOT_CHECK_FRAME` (default) requires the entry to
-be present and to name the frame the write asked for, which is what a
-vendor poison descriptor fails, `HK_SLOT_CHECK_PRESENT` is the historical
-present test, `HK_SLOT_CHECK_NONE` skips the test and the page table read
-with it. both settings are process wide and are read at every write.
-
-**int hk_patch_symbols_init(void)** resolves every symbol the write paths
-need, in process context, and is called from hk_init. the wrappers resolve
-lazily when it was not called, and a lazy resolve can land inside
-stop_machine where the kallsyms walk may not sleep. returns the number of
-optional symbols that are missing.
+**int hk_patch_write(void *dst, unsigned long val)** writes one unsigned long
+through the configured path, which is what a table entry needs. -EINVAL on a
+bad argument, -ENOENT when a symbol the path needs is absent, -EIO or -EFAULT
+when the address cannot be reached.
 
 **int hk_patch_prepare(struct hk_patch_set *set, struct hk_patch_hook *hook)**
 
@@ -175,7 +127,7 @@ every site is compared against the bytes the prepare saw before the
 first write, so a site another writer took is -EAGAIN with nothing
 changed. a write that fails after that point puts the sites already
 written back, so a set is all in or all out, and the failing code is
-returned.
+returned. the writes take the configured path.
 
 **int hk_patch_rollback(struct hk_patch_set *set)**
 
