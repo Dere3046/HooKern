@@ -35,7 +35,6 @@ int hk_write_text(void *dst, const void *src, size_t len);
 int hk_write_kernel(void *dst, const void *src, size_t len);
 int hk_write_one(void *dst, u32 insn);
 int hk_write_fixmap(void *dst, const void *src, size_t len);
-int hk_write_fixmap_raw(void *dst, const void *src, size_t len);
 int hk_write_direct(void *dst, const void *src, size_t len);
 
 /*
