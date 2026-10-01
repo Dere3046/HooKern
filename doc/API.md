@@ -80,9 +80,9 @@ kernel's own frame, so it assumes nothing about the headers this module was
 built with.
 
 **int hk_write_fixmap(void *dst, const void *src, size_t len)** writes byte
-wide, per page, through a slot this build maps itself, and checks before the
-store that the slot carries the frame that was asked for. **int
-hk_write_fixmap_raw(...)** is the same write without that check.
+wide, per page, through a slot this build maps itself. a caller that wants the
+destination checked before the store asks **hk_va_maps(unsigned long va,
+unsigned long pa)** and decides what to do with the answer.
 
 **int hk_write_direct(void *dst, const void *src, size_t len)** stores where
 the kernel already mapped the page writable. **bool hk_va_writable(unsigned
@@ -105,7 +105,7 @@ calls sleep.
 
 **unsigned long hk_va_to_pa(unsigned long va)** translates an address, 0 when
 it cannot be translated, and **bool hk_va_maps(unsigned long va, unsigned long
-pa)** answers whether an address carries a frame.
+pa)** answers whether an address is mapped and carries that frame.
 
 **int hk_patch_write(void *dst, unsigned long val)** writes one unsigned long
 through the configured path, which is what a table entry needs. -EINVAL on a
