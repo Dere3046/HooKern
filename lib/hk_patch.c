@@ -35,7 +35,7 @@
  * one, which nothing holds after early_ioremap_reset
  */
 #define HK_FIXMAP_SLOT_BASE FIX_BTMAP_END
-#define HK_FIXMAP_SLOT_MAX HK_PATCH_SLOT_LIMIT
+#define HK_FIXMAP_SLOT_MAX 8
 
 typedef void (*clean_inval_fn)(unsigned long start, unsigned long end);
 typedef void (*fixmap_fn)(unsigned long idx, phys_addr_t phys, pgprot_t prot);
@@ -51,23 +51,17 @@ typedef int (*core_kernel_text_fn)(unsigned long addr);
  * at all and every caller is documented as process context
  */
 static DEFINE_MUTEX(g_patch_lock);
-static enum hk_slot_check g_slot_check = HK_SLOT_CHECK_FRAME;
-static bool g_slot_direct = true;
+/*
+ * the path a plain call takes, set once by hk_init from the configuration of the
+ * consumer and never changed afterwards. the library keeps no other state, and
+ * every decision about fallbacks, retries and tests belongs to the caller
+ */
+static int (*g_write)(void *dst, const void *src, size_t len);
 static vmalloc_to_page_fn g_vmalloc_to_page;
 static core_kernel_text_fn g_core_kernel_text;
-
-bool hk_patch_slot_direct(void)
-{
-	return g_slot_direct;
-}
-
-void hk_patch_set_slot_direct(bool on)
-{
-	g_slot_direct = on;
-}
-
 static unsigned long *hk_dst_pte(unsigned long addr);
 static bool hk_kernel_image_addr(unsigned long addr);
+static __nocfi noinline int hk_translate(unsigned long addr, unsigned long *out);
 
 /*
  * the kernel's own is_image_text, asked of the kernel when the symbol is there
@@ -87,18 +81,42 @@ static bool hk_image_text(unsigned long addr)
  * kernel already maps writable is written in place, exactly like patch_map does
  * when the strict rwx configs are off
  */
-static bool hk_direct_write_ok(unsigned long addr)
+/*
+ * the three answers a caller needs to judge a destination itself. no state is
+ * kept, so a policy built on them lives in one place: where it is written
+ */
+bool hk_va_writable(unsigned long va)
 {
 	unsigned long *ptep;
 	unsigned long pte;
 
-	if (!g_slot_direct)
-		return false;
-	ptep = hk_dst_pte(addr);
+	ptep = hk_dst_pte(va);
 	if (!ptep)
 		return false;
 	pte = READ_ONCE(*ptep);
 	return pte_present(__pte(pte)) && pte_write(__pte(pte));
+}
+
+bool hk_va_maps(unsigned long va, unsigned long pa)
+{
+	unsigned long *ptep;
+	unsigned long pte;
+
+	ptep = hk_dst_pte(va);
+	if (!ptep)
+		return false;
+	pte = READ_ONCE(*ptep);
+	return pte_present(__pte(pte)) &&
+	       __pte_to_phys(__pte(pte)) == (pa & PAGE_MASK);
+}
+
+unsigned long hk_va_to_pa(unsigned long va)
+{
+	unsigned long pa = 0;
+
+	if (hk_translate(va, &pa))
+		return 0;
+	return pa;
 }
 
 static clean_inval_fn g_clean_inval;
@@ -108,9 +126,8 @@ static insn_patch_fn g_insn_patch;
 static unsigned long g_image_start;
 static unsigned long g_image_end;
 static bool g_image_read;
-static bool g_slot_broken;
 
-int hk_patch_symbols_init(void)
+void hk_patch_init(void)
 {
 	unsigned long fn;
 	int missing = 0;
@@ -155,7 +172,6 @@ int hk_patch_symbols_init(void)
 		g_core_kernel_text = (core_kernel_text_fn)fn;
 
 	pr_info("[lkmhook] patch symbols ready, %d optional missing\n", missing);
-	return missing;
 }
 
 /*
@@ -166,19 +182,12 @@ int hk_patch_symbols_init(void)
  * path is the runtime half of the same answer, it probes the address the slot
  * actually resolved to
  */
-static int hk_patch_slot_index(unsigned int slot, int *out)
+static int hk_patch_slot_index(int *out)
 {
-	unsigned long idx;
-
-	if (slot > HK_PATCH_SLOT_MASK || slot >= HK_FIXMAP_SLOT_MAX) {
-		pr_warn("[lkmhook] fixmap slot %u is over the library range\n",
-			slot);
-		return -EINVAL;
-	}
-	idx = HK_FIXMAP_SLOT_BASE + slot;
+	unsigned long idx = HK_FIXMAP_SLOT_BASE;
 	if (idx > FIX_BTMAP_BEGIN) {
-		pr_warn("[lkmhook] fixmap slot %u lands outside the early ioremap window\n",
-			slot);
+		pr_warn("[lkmhook] fixmap base 0x%lx lands outside the early ioremap window\n",
+			idx);
 		return -EINVAL;
 	}
 	*out = (int)idx;
@@ -276,9 +285,6 @@ static int hk_patch_dst_check(unsigned long va, int idx, unsigned long caller,
 	unsigned long *ptep;
 	unsigned long pte;
 
-	if (g_slot_check == HK_SLOT_CHECK_NONE)
-		return 0;
-
 	ptep = hk_dst_pte(va);
 	if (ptep) {
 		pte = READ_ONCE(*ptep);
@@ -290,64 +296,12 @@ static int hk_patch_dst_check(unsigned long va, int idx, unsigned long caller,
 		 * here. only the frame that was asked for proves the alias
 		 */
 		if (pte_present(__pte(pte)) &&
-		    (g_slot_check == HK_SLOT_CHECK_PRESENT ||
-		     __pte_to_phys(__pte(pte)) == (want & PAGE_MASK)))
+		    __pte_to_phys(__pte(pte)) == (want & PAGE_MASK))
 			return 0;
 	}
-#if HK_PATCH_DST_CHECK
 	pr_warn("[lkmhook] fixmap %d dest 0x%lx is not the frame asked for, caller 0x%lx, refused\n",
 		idx, va, caller);
-#endif
 	return -ENXIO;
-}
-
-/*
- * a refused alias is a property of the build pair and not of one address, so the
- * first refusal takes the slot path out for good. every later write goes straight
- * to the kernel's own primitive, whose frame is the kernel's
- */
-static enum hk_slot_policy g_slot_policy = HK_SLOT_POLICY_FALLBACK;
-
-enum hk_slot_check hk_patch_slot_check(void)
-{
-	return g_slot_check;
-}
-
-void hk_patch_set_slot_check(enum hk_slot_check check)
-{
-	if (check > HK_SLOT_CHECK_PRESENT)
-		return;
-	g_slot_check = check;
-}
-
-enum hk_slot_policy hk_patch_slot_policy(void)
-{
-	return g_slot_policy;
-}
-
-void hk_patch_set_slot_policy(enum hk_slot_policy policy)
-{
-	if (policy > HK_SLOT_POLICY_OFF)
-		return;
-	if (policy != HK_SLOT_POLICY_FALLBACK)
-		g_slot_broken = false;
-	g_slot_policy = policy;
-}
-
-static void hk_slot_disable(const char *why)
-{
-	/*
-	 * only the fallback policy retires the path. a caller that asked for
-	 * retry keeps it, one that asked for force never reaches a refusal, and
-	 * one that turned the path off never opened it
-	 */
-	if (g_slot_policy != HK_SLOT_POLICY_FALLBACK)
-		return;
-	if (g_slot_broken)
-		return;
-	g_slot_broken = true;
-	pr_warn("[lkmhook] slot path disabled for this module: %s, every later write uses the kernel patch primitive\n",
-		why);
 }
 
 /*
@@ -435,6 +389,7 @@ struct hk_patch_job {
 	size_t len;
 	int flags;
 	int idx;
+	bool verify;
 	unsigned long caller;
 	atomic_t arrived;
 	int ret;
@@ -451,7 +406,8 @@ struct hk_patch_job {
  * slot is not shared and neither is the kernel patch slot
  */
 static int hk_patch_slot_run(unsigned long addr, const void *src, size_t len,
-			     int flags, int idx, unsigned long caller)
+			     int flags, int idx, bool verify,
+			     unsigned long caller)
 {
 	size_t left = len;
 	int ret = 0;
@@ -462,60 +418,42 @@ static int hk_patch_slot_run(unsigned long addr, const void *src, size_t len,
 		size_t chunk;
 		bool opened = false;
 
+		ret = hk_translate(addr, &phys);
+		if (ret)
+			break;
 		/*
-		 * a page the kernel already maps writable is written where it is,
-		 * which is what the kernel's own patch_map does when the strict
-		 * rwx configs are off. no fixmap entry is trusted for that write
+		 * a frame the kernel does not own must never reach the alias, so
+		 * it is refused before the slot is opened
 		 */
-		if (hk_direct_write_ok(addr)) {
-			dst = addr;
-			chunk = min(left, PAGE_SIZE - (addr & ~PAGE_MASK));
-		} else {
-			ret = hk_translate(addr, &phys);
-			if (ret)
-				break;
-			/*
-			 * a frame the kernel does not own must never reach the
-			 * alias, so it is refused before the slot is opened
-			 */
-			if (g_slot_policy != HK_SLOT_POLICY_FORCE &&
-			    !pfn_valid(phys >> PAGE_SHIFT)) {
-				pr_warn("[lkmhook] 0x%lx resolves to a frame outside memory, refused\n",
-					addr);
-				ret = -EFAULT;
-				break;
-			}
-			chunk = min(left, PAGE_SIZE - (phys & ~PAGE_MASK));
-
-			ret = call_set_fixmap(idx, phys & PAGE_MASK,
-					      PAGE_KERNEL);
-			if (ret)
-				break;
-			dst = __fix_to_virt(idx) + (phys & ~PAGE_MASK);
-			if (g_slot_policy == HK_SLOT_POLICY_FORCE)
-				ret = 0;
-			else
-				ret = hk_patch_dst_check(dst, idx, caller,
-							 phys);
-			if (ret) {
-				call_set_fixmap(idx, 0, __pgprot(0));
-				break;
-			}
-			opened = true;
+		if (!pfn_valid(phys >> PAGE_SHIFT)) {
+			pr_warn("[lkmhook] 0x%lx resolves to a frame outside memory, refused\n",
+				addr);
+			ret = -EFAULT;
+			break;
 		}
+		chunk = min(left, PAGE_SIZE - (phys & ~PAGE_MASK));
+
+		ret = call_set_fixmap(idx, phys & PAGE_MASK, PAGE_KERNEL);
+		if (ret)
+			break;
+		dst = __fix_to_virt(idx) + (phys & ~PAGE_MASK);
+		if (verify)
+			ret = hk_patch_dst_check(dst, idx, caller, phys);
+		if (ret) {
+			call_set_fixmap(idx, 0, __pgprot(0));
+			break;
+		}
+		opened = true;
 
 		memcpy((void *)dst, src, chunk);
 		dsb(ish);
 		if (opened)
 			call_set_fixmap(idx, 0, __pgprot(0));
 
-		if (flags & HK_PATCH_FLUSH_DCACHE) {
-			ret = call_clean_inval(addr, addr + chunk);
-			if (ret)
-				break;
-		}
-		if (flags & HK_PATCH_FLUSH_ICACHE)
-			hk_flush_icache(addr);
+		ret = call_clean_inval(addr, addr + chunk);
+		if (ret)
+			break;
+		hk_flush_icache(addr);
 
 		src += chunk;
 		addr += chunk;
@@ -542,7 +480,7 @@ static int hk_patch_slot_cb(void *data)
 		return 0;
 	}
 	job->ret = hk_patch_slot_run(job->addr, job->src, job->len, job->flags,
-				     job->idx, job->caller);
+				     job->idx, job->verify, job->caller);
 	smp_store_release(&job->done, 1);
 	return job->ret;
 }
@@ -693,129 +631,110 @@ static __nocfi int hk_insn_write_run(unsigned long addr, const void *src,
 	return 0;
 }
 
-int hk_patch_text_at(void *dst, const void *src, size_t len, int flags,
-		     unsigned int slot)
+/*
+ * the slot path, shared by the verified and the raw entry points. the alias is
+ * opened per physical page and dropped again, and the caller holds g_patch_lock,
+ * so the slot is not shared and neither is the kernel patch slot. one slot serves
+ * any length: up to four bytes are written where the caller stands, longer runs
+ * park the cores first, which is what the kernel's own patcher does
+ */
+static int hk_fixmap_write(void *dst, const void *src, size_t len, bool verify)
 {
 	struct hk_patch_job job;
 	unsigned long addr = (unsigned long)dst;
 	unsigned long caller = (unsigned long)__builtin_return_address(0);
-	unsigned int mode = (flags >> HK_PATCH_MODE_SHIFT) & HK_PATCH_MODE_MASK;
 	int ret;
 
 	if (!dst || !src || !len || (len & 3))
 		return -EINVAL;
-	if (slot > HK_PATCH_SLOT_MASK)
-		return -EINVAL;
-	if (mode > HK_PATCH_MODE_FIXMAP)
-		return -EINVAL;
 
 	mutex_lock(&g_patch_lock);
-	if (mode == HK_PATCH_MODE_FIXMAP) {
-		/*
-		 * the kernel's own text poke slot, kept in the enum of this build.
-		 * __set_fixmap maps the address this index computes and the frame
-		 * check below refuses the write when that address does not carry
-		 * the frame that was asked for, so a vendor kernel that moved the
-		 * entry is a refused write and not a corrupt one
-		 */
-		job.idx = (int)FIX_TEXT_POKE0;
-		ret = 0;
-	} else {
-		ret = hk_patch_slot_index(slot, &job.idx);
-	}
-	if (ret) {
-		pr_warn("[lkmhook] fixmap slot %u is not usable, %d\n", slot,
-			ret);
+	ret = hk_patch_slot_index(&job.idx);
+	if (ret)
 		goto out;
-	}
+
 	job.addr = addr;
 	job.src = src;
 	job.len = len;
-	job.flags = flags;
+	job.flags = 0;
+	job.verify = verify;
 	job.caller = caller;
 	atomic_set(&job.arrived, 0);
 	job.done = 0;
 	job.ret = 0;
 
-	if (g_slot_broken && mode == HK_PATCH_MODE_SLOT)
-		mode = HK_PATCH_MODE_INSN_PATCH;
-
-	/*
-	 * a module address is written by the kernel's own primitive whichever
-	 * mode was asked for. its patch_map reaches the page through the module
-	 * page table and through the kernel's own fixmap frame, so it is correct
-	 * on a kernel whose VA_BITS is not the one this module was built with,
-	 * which is exactly the case the slot path cannot survive
-	 */
-	/*
-	 * a module or vmalloc address has a page table the kernel's own patch
-	 * primitive already reaches, and its entries are the ones a vendor
-	 * kernel is most likely to mark in a way this walk cannot judge, so
-	 * those addresses never take the slot path. the image and the linear map
-	 * keep it, and the module lookup is only a hint: the range test stands on
-	 * its own when that symbol is missing
-	 */
-	if (mode == HK_PATCH_MODE_SLOT &&
-	    (g_slot_policy == HK_SLOT_POLICY_OFF ||
-	     hk_is_module_addr(addr) ||
-	     (!hk_kernel_image_addr(addr) && !__is_lm_address(addr))))
-		mode = HK_PATCH_MODE_INSN_PATCH;
-
-	if (mode == HK_PATCH_MODE_INSN_PATCH) {
-		ret = hk_insn_patch_run(addr, src, len);
-	} else if (mode == HK_PATCH_MODE_INSN_WRITE) {
-		ret = hk_insn_write_run(addr, src, len);
-	} else if (len <= 4) {
-		ret = hk_patch_slot_run(addr, src, len, flags, job.idx,
+	if (len <= 4) {
+		ret = hk_patch_slot_run(addr, src, len, 0, job.idx, verify,
 					caller);
-		if (ret == -ENXIO) {
-			if (mode == HK_PATCH_MODE_SLOT)
-				hk_slot_disable("the alias is outside the running kernel fixmap window");
-			ret = hk_insn_patch_run(addr, src, len);
-		}
 	} else {
 		struct hk_patch_job saved = job;
 
 		ret = stop_machine(hk_patch_slot_cb, &job, cpu_online_mask);
-		/*
-		 * the slot frame is a constant of this build and the frame of the
-		 * running kernel is not, so the alias can land outside the kernel's
-		 * fixmap window. the destination gate answers that with -ENXIO
-		 * before the store, and the kernel's own primitive is then the only
-		 * write path left that still has the right frame
-		 */
-		if (ret == -ENXIO) {
-			if (mode == HK_PATCH_MODE_SLOT)
-				hk_slot_disable("the alias is outside the running kernel fixmap window");
-			ret = hk_insn_patch_run(saved.addr, saved.src,
-						saved.len);
-		}
+		if (ret)
+			pr_warn("[lkmhook] patch 0x%lx+%zu mode fixmap failed %d\n",
+				saved.addr, saved.len, ret);
 	}
-	if (ret)
-		pr_warn("[lkmhook] patch 0x%lx+%zu mode %u failed %d\n",
-			addr, len, mode, ret);
 out:
 	mutex_unlock(&g_patch_lock);
 	return ret;
 }
 
-int hk_patch_text(void *dst, const void *src, size_t len, int flags)
+int hk_write_fixmap(void *dst, const void *src, size_t len)
 {
-	return hk_patch_text_at(dst, src, len, flags, HK_PATCH_SLOT_DEFAULT);
+	return hk_fixmap_write(dst, src, len, true);
 }
 
-int hk_patch_write_at(void *dst, unsigned long val, int flags)
+int hk_write_fixmap_raw(void *dst, const void *src, size_t len)
 {
-	unsigned int slot = (flags >> HK_PATCH_SLOT_SHIFT) & HK_PATCH_SLOT_MASK;
+	return hk_fixmap_write(dst, src, len, false);
+}
 
-	return hk_patch_text_at(dst, &val, sizeof(val), flags, slot);
+int hk_write_kernel(void *dst, const void *src, size_t len)
+{
+	if (!dst || !src || !len || (len & 3))
+		return -EINVAL;
+	return hk_insn_patch_run((unsigned long)dst, src, len);
+}
+
+int hk_write_one(void *dst, u32 insn)
+{
+	if (!dst)
+		return -EINVAL;
+	return hk_insn_write_run((unsigned long)dst, &insn, sizeof(insn));
+}
+
+/*
+ * the page is written where it is. the caller checked it with hk_va_writable,
+ * the library does not repeat the test
+ */
+int hk_write_direct(void *dst, const void *src, size_t len)
+{
+	if (!dst || !src || !len)
+		return -EINVAL;
+	memcpy(dst, (const void *)src, len);
+	dsb(ish);
+	return call_clean_inval((unsigned long)dst, (unsigned long)dst + len);
+}
+
+int hk_write_text(void *dst, const void *src, size_t len)
+{
+	if (g_write)
+		return g_write(dst, src, len);
+	return hk_write_kernel(dst, src, len);
+}
+
+/*
+ * called once by hk_init, in process context, with the write path the consumer
+ * configured. the library only records it
+ */
+void hk_patch_set_write(int (*write)(void *dst, const void *src, size_t len))
+{
+	g_write = write;
 }
 
 int hk_patch_write(void *dst, unsigned long val)
 {
-	return hk_patch_text_at(dst, &val, sizeof(val),
-				HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE,
-				HK_PATCH_SLOT_DEFAULT);
+	return hk_write_text(dst, &val, sizeof(val));
 }
 
 void hk_patch_set_init(struct hk_patch_set *set)
@@ -906,10 +825,7 @@ int hk_patch_commit(struct hk_patch_set *set)
 	}
 
 	list_for_each_entry(hook, &set->hooks, list) {
-		ret = hk_patch_text_at(hook->dst, hook->src, hook->len,
-				       hook->flags,
-				       (hook->flags >> HK_PATCH_SLOT_SHIFT) &
-					       HK_PATCH_SLOT_MASK);
+		ret = hk_write_text(hook->dst, hook->src, hook->len);
 		if (ret) {
 			failed = hook;
 			break;
@@ -922,11 +838,7 @@ int hk_patch_commit(struct hk_patch_set *set)
 	list_for_each_entry(hook, &set->hooks, list) {
 		if (hook == failed)
 			break;
-		hk_patch_text_at(hook->dst, hook->orig, hook->len,
-				 hook->flags | HK_PATCH_FLUSH_ICACHE |
-					 HK_PATCH_FLUSH_DCACHE,
-				 (hook->flags >> HK_PATCH_SLOT_SHIFT) &
-					 HK_PATCH_SLOT_MASK);
+		hk_write_text(hook->dst, hook->orig, hook->len);
 		hook->active = false;
 	}
 	pr_warn("[lkmhook] commit rolled back at %s, %d\n",
@@ -947,12 +859,7 @@ int hk_patch_rollback(struct hk_patch_set *set)
 
 		if (!hook->active)
 			continue;
-		ret = hk_patch_text_at(hook->dst, hook->orig, hook->len,
-				       hook->flags | HK_PATCH_FLUSH_ICACHE |
-					       HK_PATCH_FLUSH_DCACHE,
-				       (hook->flags >>
-					HK_PATCH_SLOT_SHIFT) &
-					       HK_PATCH_SLOT_MASK);
+		ret = hk_write_text(hook->dst, hook->orig, hook->len);
 		if (ret) {
 			pr_warn("[lkmhook] rollback %s failed %d\n",
 				hook->name ? hook->name : "?", ret);

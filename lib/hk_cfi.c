@@ -27,8 +27,7 @@ static int hk_patch_ret_addr(const char *what, unsigned long fn)
 		return -EFAULT;
 	if (cur == ret)
 		return 0;
-	hk_patch_text((void *)fn, &ret, 4,
-		      HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE);
+	hk_write_text((void *)fn, &ret, 4);
 	pr_info("[lkmhook] cfi bypass %s\n", what);
 	return 0;
 }
@@ -49,8 +48,7 @@ static int hk_patch_mov_ret_addr(const char *what, unsigned long fn)
 		return -EFAULT;
 	if (cur == mov_ret[0])
 		return 0;
-	hk_patch_text((void *)fn, mov_ret, sizeof(mov_ret),
-		      HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE);
+	hk_write_text((void *)fn, mov_ret, sizeof(mov_ret));
 	pr_info("[lkmhook] cfi bypass %s\n", what);
 	return 0;
 }

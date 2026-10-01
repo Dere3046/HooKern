@@ -100,11 +100,12 @@ int hk_init(const struct hk_cfg *cfg)
 
 	g_cfg = *cfg;
 	g_exiting = false;
+	hk_patch_set_write(cfg->write);
 	/*
 	 * resolve the write path symbols here and not on first use: a lazy resolve
 	 * inside stop_machine would walk kallsyms from an atomic context
 	 */
-	hk_patch_symbols_init();
+	hk_patch_init();
 	pr_info("[lkmhook] init\n");
 	return 0;
 }

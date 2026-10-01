@@ -10,6 +10,13 @@
 
 struct hk_cfg {
 	unsigned long (*resolve)(const char *name);
+	/*
+	 * how the library writes text when a caller does not name a path itself,
+	 * one of the hk_write_* primitives of hk_patch.h. NULL takes the kernel's
+	 * own primitive, which assumes nothing about the headers this module was
+	 * built with. the value is read once, in hk_init
+	 */
+	int (*write)(void *dst, const void *src, size_t len);
 };
 
 static inline bool hk_ker_addr_ok(unsigned long v)

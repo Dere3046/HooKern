@@ -805,8 +805,7 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	if (ret)
 		goto err_guard;
 
-	ret = hk_patch_text((void *)mem, tramp, ctx.count * 4 + 24,
-			    HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE);
+	ret = hk_write_text((void *)mem, tramp, ctx.count * 4 + 24);
 	if (ret)
 		goto err_guard;
 
@@ -822,11 +821,9 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	detour[2] = HK_INS_RET_X17;
 	detour[3] = mem & 0xFFFFFFFF;
 	detour[4] = mem >> 32;
-	ret = hk_patch_text((void *)addr, detour, HK_INLINE_PATCH_LEN,
-			    HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE);
+	ret = hk_write_text((void *)addr, detour, HK_INLINE_PATCH_LEN);
 	if (ret) {
-		hk_patch_text((void *)addr, h->saved, HK_INLINE_PATCH_LEN,
-			      HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE);
+		hk_write_text((void *)addr, h->saved, HK_INLINE_PATCH_LEN);
 		goto err_guard;
 	}
 
@@ -887,8 +884,7 @@ int hk_inline_disable(struct hk_inline *h)
 		mutex_unlock(&g_inline_lock);
 		return 0;
 	}
-	if (hk_patch_text((void *)h->addr, h->saved, HK_INLINE_PATCH_LEN,
-			  HK_PATCH_FLUSH_DCACHE | HK_PATCH_FLUSH_ICACHE)) {
+	if (hk_write_text((void *)h->addr, h->saved, HK_INLINE_PATCH_LEN)) {
 		mutex_unlock(&g_inline_lock);
 		return -EIO;
 	}
