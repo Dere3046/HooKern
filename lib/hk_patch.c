@@ -56,13 +56,67 @@ static DEFINE_MUTEX(g_patch_lock);
  */
 static int (*g_write)(void *dst, const void *src, size_t len);
 typedef struct vm_struct *(*find_vm_area_fn)(const void *addr);
+typedef struct page *(*vmalloc_to_page_fn)(const void *addr);
+typedef int (*core_kernel_text_fn)(unsigned long addr);
+
+#define HK_WALK_PTE 0
+#define HK_WALK_PMD 1
+#define HK_WALK_PUD 2
+#define HK_WALK_P4D 3
+
+static unsigned long *hk_dst_pte(unsigned long addr);
+static bool hk_kernel_image_addr(unsigned long addr);
+static __nocfi noinline int hk_translate(unsigned long addr, unsigned long *out);
+
+static int hk_walk_pa(unsigned long addr, unsigned long *out,
+		     unsigned long *desc, int *level);
+
+static vmalloc_to_page_fn g_vmalloc_to_page;
+static core_kernel_text_fn g_core_kernel_text;
+/*
+ * an address the kernel's own patch_map would hand to vmalloc_to_page is every
+ * address that is not core kernel text, which is the same test the kernel makes
+ */
+/*
+ * both symbols are called through a resolved pointer, and on a 5.10 kernel an
+ * indirect call to a runtime resolved function has to sit inside a __nocfi
+ * wrapper, the same rule the rest of this library follows
+ */
+static __nocfi noinline bool call_core_kernel_text(unsigned long addr)
+{
+	if (!g_core_kernel_text)
+		return false;
+	return g_core_kernel_text(addr) != 0;
+}
+
+static __nocfi noinline struct page *call_vmalloc_to_page(const void *addr)
+{
+	if (!g_vmalloc_to_page)
+		return NULL;
+	return g_vmalloc_to_page(addr);
+}
+
+static bool hk_kernel_would_vmalloc(unsigned long addr)
+{
+	if (g_core_kernel_text)
+		return !call_core_kernel_text(addr);
+	return !hk_kernel_image_addr(addr);
+}
+
+static unsigned long *hk_dst_pte(unsigned long addr);
+static bool hk_kernel_image_addr(unsigned long addr);
+static __nocfi noinline int hk_translate(unsigned long addr, unsigned long *out);
+
+static int hk_walk_pa(unsigned long addr, unsigned long *out,
+		     unsigned long *desc, int *level);
+
+static vmalloc_to_page_fn g_vmalloc_to_page;
+static core_kernel_text_fn g_core_kernel_text;
 static find_vm_area_fn g_find_vm_area;
 static unsigned long (*g_vmalloc_to_pfn_fn)(const void *addr);
 static unsigned long g_kimage_voffset;
 static bool g_kimage_voffset_read;
-static unsigned long *hk_dst_pte(unsigned long addr);
-static bool hk_kernel_image_addr(unsigned long addr);
-static __nocfi noinline int hk_translate(unsigned long addr, unsigned long *out);
+
 
 /*
  * the target's own entry decides whether the alias is needed at all. a page the
@@ -70,39 +124,19 @@ static __nocfi noinline int hk_translate(unsigned long addr, unsigned long *out)
  * when the strict rwx configs are off
  */
 /*
- * the three answers a caller needs to judge a destination itself. no state is
- * kept, so a policy built on them lives in one place: where it is written
+ * the kernel's own translation, which is what the kernel's own patcher uses and
+ * therefore agrees with it byte for byte. a kernel older than 5.13 answers a block
+ * mapped address with a null page instead of an error, and the frame that comes
+ * out of it is whatever the arithmetic makes of that, so the answer is checked
+ * against the memory the kernel owns before it is handed back
  */
-bool hk_va_writable(unsigned long va)
-{
-	unsigned long *ptep;
-	unsigned long pte;
-
-	ptep = hk_dst_pte(va);
-	if (!ptep)
-		return false;
-	pte = READ_ONCE(*ptep);
-	return pte_present(__pte(pte)) && pte_write(__pte(pte));
-}
-
-bool hk_va_maps(unsigned long va, unsigned long pa)
-{
-	unsigned long *ptep;
-	unsigned long pte;
-
-	ptep = hk_dst_pte(va);
-	if (!ptep)
-		return false;
-	pte = READ_ONCE(*ptep);
-	return pte_present(__pte(pte)) &&
-	       __pte_to_phys(__pte(pte)) == (pa & PAGE_MASK);
-}
-
 unsigned long hk_va_to_pa(unsigned long va)
 {
 	unsigned long pa = 0;
 
 	if (hk_translate(va, &pa))
+		return 0;
+	if (!pfn_valid(pa >> PAGE_SHIFT))
 		return 0;
 	return pa;
 }
@@ -152,6 +186,18 @@ void hk_patch_init(void)
 	 * the two the slot path needs are optional on their own: the image and
 	 * the linear map are translated arithmetically and never ask for them
 	 */
+
+	/*
+	 * the two the block mapping test needs. core_kernel_text is the kernel's own
+	 * test for the addresses its patcher translates arithmetically, and
+	 * vmalloc_to_page is asked directly for the block mapped ones
+	 */
+	fn = hk_resolve("core_kernel_text");
+	if (fn && hk_ker_addr_ok(fn))
+		g_core_kernel_text = (core_kernel_text_fn)fn;
+	fn = hk_resolve("vmalloc_to_page");
+	if (fn && hk_ker_addr_ok(fn))
+		g_vmalloc_to_page = (vmalloc_to_page_fn)fn;
 
 	pr_info("[lkmhook] patch symbols ready, %d optional missing\n", missing);
 }
@@ -249,6 +295,115 @@ static unsigned long *hk_dst_pte(unsigned long addr)
 	if (pmd_none(*pmd) || pmd_bad(*pmd))
 		return NULL;
 	return (unsigned long *)pte_offset_kernel(pmd, addr);
+}
+
+/*
+ * the library's own translation. every level is asked for none, bad and leaf in
+ * that order, because on arm64 a block descriptor fails the table test, so the
+ * leaf question has to be asked first. the kernel's own vmalloc_to_page only
+ * learned that in 5.13, and its 5.10 form warns and returns NULL for a block,
+ * which is a wrong frame rather than an error
+ */
+static int hk_walk_pa(unsigned long addr, unsigned long *out,
+		     unsigned long *desc, int *level)
+{
+	struct mm_struct *mm;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+	mm = (struct mm_struct *)hk_resolve("init_mm");
+	if (!mm || !hk_ker_addr_ok((unsigned long)mm))
+		return -ENOENT;
+
+	pgd = pgd_offset(mm, addr);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return -ENOENT;
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return -ENOENT;
+#if defined(p4d_leaf)
+	if (p4d_leaf(*p4d)) {
+		*out = __p4d_to_phys(*p4d) + (addr & ~P4D_MASK);
+		if (desc)
+			*desc = p4d_val(*p4d);
+		if (level)
+			*level = HK_WALK_P4D;
+		return 0;
+	}
+#endif
+	pud = pud_offset(p4d, addr);
+	if (pud_none(*pud) || pud_bad(*pud))
+		return -ENOENT;
+#if defined(pud_leaf)
+	if (pud_leaf(*pud)) {
+		*out = __pud_to_phys(*pud) + (addr & ~PUD_MASK);
+		if (desc)
+			*desc = pud_val(*pud);
+		if (level)
+			*level = HK_WALK_PUD;
+		return 0;
+	}
+#endif
+	pmd = pmd_offset(pud, addr);
+	if (pmd_none(*pmd))
+		return -ENOENT;
+#if defined(pmd_leaf)
+	if (pmd_leaf(*pmd)) {
+		*out = __pmd_to_phys(*pmd) + (addr & ~PMD_MASK);
+		if (desc)
+			*desc = pmd_val(*pmd);
+		if (level)
+			*level = HK_WALK_PMD;
+		return 0;
+	}
+#endif
+	if (pmd_bad(*pmd))
+		return -ENOENT;
+	pte = pte_offset_kernel(pmd, addr);
+	if (!pte_present(*pte))
+		return -ENOENT;
+	*out = __pte_to_phys(*pte) + (addr & ~PAGE_MASK);
+	if (desc)
+		*desc = pte_val(*pte);
+	if (level)
+		*level = HK_WALK_PTE;
+	return 0;
+}
+
+unsigned long hk_va_walk_pa(unsigned long va)
+{
+	unsigned long pa = 0;
+
+	if (hk_walk_pa(va, &pa, NULL, NULL))
+		return 0;
+	return pa;
+}
+
+/*
+ * the same walk, answering what a caller checks a destination with. the answer
+ * comes from the descriptor of the level that maps the address, so a block mapping
+ * answers as truthfully as a page one
+ */
+bool hk_va_writable(unsigned long va)
+{
+	unsigned long pa = 0;
+	unsigned long desc = 0;
+
+	if (hk_walk_pa(va, &pa, &desc, NULL))
+		return false;
+	return pte_write(__pte(desc));
+}
+
+bool hk_va_maps(unsigned long va, unsigned long pa)
+{
+	unsigned long got = 0;
+
+	if (hk_walk_pa(va, &got, NULL, NULL))
+		return false;
+	return (got & PAGE_MASK) == (pa & PAGE_MASK);
 }
 
 /*
@@ -370,6 +525,7 @@ struct hk_patch_job {
 	int flags;
 	int idx;
 	unsigned long caller;
+	unsigned long (*to_pa)(unsigned long va);
 	atomic_t arrived;
 	int ret;
 	/*
@@ -385,7 +541,8 @@ struct hk_patch_job {
  * slot is not shared and neither is the kernel patch slot
  */
 static int hk_patch_slot_run(unsigned long addr, const void *src, size_t len,
-			     int flags, int idx, unsigned long caller)
+			     int flags, int idx, unsigned long caller,
+			     unsigned long (*to_pa)(unsigned long va))
 {
 	size_t left = len;
 	int ret = 0;
@@ -396,9 +553,13 @@ static int hk_patch_slot_run(unsigned long addr, const void *src, size_t len,
 		size_t chunk;
 		bool opened = false;
 
-		ret = hk_translate(addr, &phys);
-		if (ret)
+		phys = to_pa(addr);
+		if (!phys) {
+			pr_warn("[lkmhook] 0x%lx cannot be translated, refused\n",
+				addr);
+			ret = -ENOENT;
 			break;
+		}
 		chunk = min(left, PAGE_SIZE - (phys & ~PAGE_MASK));
 
 		ret = call_set_fixmap(idx, phys & PAGE_MASK, PAGE_KERNEL);
@@ -446,7 +607,7 @@ static int hk_patch_slot_cb(void *data)
 		return 0;
 	}
 	job->ret = hk_patch_slot_run(job->addr, job->src, job->len, job->flags,
-				     job->idx, job->caller);
+				     job->idx, job->caller, job->to_pa);
 	smp_store_release(&job->done, 1);
 	return job->ret;
 }
@@ -604,7 +765,13 @@ static __nocfi int hk_insn_write_run(unsigned long addr, const void *src,
  * any length: up to four bytes are written where the caller stands, longer runs
  * park the cores first, which is what the kernel's own patcher does
  */
-int hk_write_fixmap(void *dst, const void *src, size_t len)
+/*
+ * the slot path, with the translation the caller named. a null one means the
+ * library's own walk, which is the only one that is correct on a kernel whose
+ * vmalloc_to_page predates leaf handling, so it is the default of hk_write_fixmap
+ */
+int hk_write_fixmap_by(void *dst, const void *src, size_t len,
+		       unsigned long (*to_pa)(unsigned long va))
 {
 	struct hk_patch_job job;
 	unsigned long addr = (unsigned long)dst;
@@ -624,12 +791,14 @@ int hk_write_fixmap(void *dst, const void *src, size_t len)
 	job.len = len;
 	job.flags = 0;
 	job.caller = caller;
+	job.to_pa = to_pa ? to_pa : hk_va_walk_pa;
 	atomic_set(&job.arrived, 0);
 	job.done = 0;
 	job.ret = 0;
 
 	if (len <= 4) {
-		ret = hk_patch_slot_run(addr, src, len, 0, job.idx, caller);
+		ret = hk_patch_slot_run(addr, src, len, 0, job.idx, caller,
+					job.to_pa);
 	} else {
 		struct hk_patch_job saved = job;
 
@@ -643,11 +812,55 @@ out:
 	return ret;
 }
 
+int hk_write_fixmap(void *dst, const void *src, size_t len)
+{
+	return hk_write_fixmap_by(dst, src, len, NULL);
+}
+
+/*
+ * false when the kernel's own patcher would send this address to a translation
+ * that cannot answer it. the engine asks this before it lets a consumer configured
+ * primitive touch its own memory
+ */
+bool hk_patch_kernel_primitive_ok(unsigned long addr)
+{
+	unsigned long phys = 0;
+	int level = HK_WALK_PTE;
+
+	if (!hk_kernel_would_vmalloc(addr))
+		return true;
+	if (hk_walk_pa(addr, &phys, NULL, &level))
+		return true;
+	if (level == HK_WALK_PTE)
+		return true;
+	/*
+	 * the address is block mapped, which is the one case the kernel's own
+	 * translation mishandled before 5.13. it is asked here, on its own, so the
+	 * answer is a page or a warning and never the BUG_ON that its patcher would
+	 * reach after a null one
+	 */
+	if (call_vmalloc_to_page((const void *)addr))
+		return true;
+	return false;
+}
+
 int hk_write_kernel(void *dst, const void *src, size_t len)
 {
+	unsigned long addr = (unsigned long)dst;
+
 	if (!dst || !src || !len || (len & 3))
 		return -EINVAL;
-	return hk_insn_patch_run((unsigned long)dst, src, len);
+	/*
+	 * the kernel would send anything that is not its own text to
+	 * vmalloc_to_page, which on an old kernel answers a block mapped address
+	 * with NULL and then trips its own BUG_ON
+	 */
+	if (!hk_patch_kernel_primitive_ok(addr)) {
+		pr_warn("[lkmhook] 0x%lx is block mapped and this kernel cannot translate it, use hk_write_fixmap\n",
+			addr);
+		return -EOPNOTSUPP;
+	}
+	return hk_insn_patch_run(addr, src, len);
 }
 
 int hk_write_one(void *dst, u32 insn)

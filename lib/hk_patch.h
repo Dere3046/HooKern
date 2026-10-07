@@ -35,6 +35,8 @@ int hk_write_text(void *dst, const void *src, size_t len);
 int hk_write_kernel(void *dst, const void *src, size_t len);
 int hk_write_one(void *dst, u32 insn);
 int hk_write_fixmap(void *dst, const void *src, size_t len);
+int hk_write_fixmap_by(void *dst, const void *src, size_t len,
+		       unsigned long (*to_pa)(unsigned long va));
 int hk_write_direct(void *dst, const void *src, size_t len);
 
 /*
@@ -42,6 +44,7 @@ int hk_write_direct(void *dst, const void *src, size_t len);
  * slot path runs is the same one hk_va_maps answers
  */
 unsigned long hk_va_to_pa(unsigned long va);
+unsigned long hk_va_walk_pa(unsigned long va);
 bool hk_va_writable(unsigned long va);
 bool hk_va_maps(unsigned long va, unsigned long pa);
 
@@ -94,6 +97,7 @@ int hk_patch_write(void *dst, unsigned long val);
  * process context, and record the configured write path
  */
 void hk_patch_init(void);
+bool hk_patch_kernel_primitive_ok(unsigned long addr);
 void hk_patch_set_write(int (*write)(void *dst, const void *src, size_t len));
 
 #endif

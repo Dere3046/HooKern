@@ -551,6 +551,19 @@ static void hk_inline_report(const char *what, const char *sym,
  * it. a claim is taken before any text is read or written and a failed install
  * hands it back, so every claim has an owner that can release it
  */
+/*
+ * the engine writes its own trampoline and jump stubs, which live in module memory,
+ * and it writes the target text. a module address is vmalloc, so on a kernel whose
+ * vmalloc_to_page predates leaf handling the kernel primitive cannot reach it, and
+ * the configured path is therefore only taken where the kernel can take it
+ */
+static int hk_engine_write(void *dst, const void *src, size_t len)
+{
+	if (!hk_patch_kernel_primitive_ok((unsigned long)dst))
+		return hk_write_fixmap(dst, src, len);
+	return hk_write_text(dst, src, len);
+}
+
 static int hk_inline_own(struct hk_inline *h, const char *sym,
 			 unsigned long start, u32 len)
 {
@@ -805,7 +818,7 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	if (ret)
 		goto err_guard;
 
-	ret = hk_write_text((void *)mem, tramp, ctx.count * 4 + 24);
+	ret = hk_engine_write((void *)mem, tramp, ctx.count * 4 + 24);
 	if (ret)
 		goto err_guard;
 
@@ -821,9 +834,9 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	detour[2] = HK_INS_RET_X17;
 	detour[3] = mem & 0xFFFFFFFF;
 	detour[4] = mem >> 32;
-	ret = hk_write_text((void *)addr, detour, HK_INLINE_PATCH_LEN);
+	ret = hk_engine_write((void *)addr, detour, HK_INLINE_PATCH_LEN);
 	if (ret) {
-		hk_write_text((void *)addr, h->saved, HK_INLINE_PATCH_LEN);
+		hk_engine_write((void *)addr, h->saved, HK_INLINE_PATCH_LEN);
 		goto err_guard;
 	}
 
@@ -884,7 +897,7 @@ int hk_inline_disable(struct hk_inline *h)
 		mutex_unlock(&g_inline_lock);
 		return 0;
 	}
-	if (hk_write_text((void *)h->addr, h->saved, HK_INLINE_PATCH_LEN)) {
+	if (hk_engine_write((void *)h->addr, h->saved, HK_INLINE_PATCH_LEN)) {
 		mutex_unlock(&g_inline_lock);
 		return -EIO;
 	}
