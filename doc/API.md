@@ -79,8 +79,20 @@ kernel's own aarch64_insn_patch_text under cpus_read_lock, up to
 kernel's own frame, so it assumes nothing about the headers this module was
 built with.
 
+the kernel sends every address that is not its own text to vmalloc_to_page, and
+the form of that function which predates 5.13 answers a block mapped address with
+a null page and then trips its own BUG_ON. the entry point asks the kernel's
+translation itself for such an address, which is a page or a warning and never the
+BUG_ON, and returns -EOPNOTSUPP with a line naming hk_write_fixmap when the kernel
+cannot take it. nothing panics the machine for it.
+
 **int hk_write_fixmap(void *dst, const void *src, size_t len)** writes byte
-wide, per page, through a slot this build maps itself. a caller that wants the
+wide, per page, through a slot this build maps itself, and translates with the
+library's own walk, which is the only route that answers a block mapped address
+correctly on every kernel. **int hk_write_fixmap_by(void *dst, const void *src,
+size_t len, unsigned long (*to_pa)(unsigned long va))** is the same write with the
+translation named by the caller: hk_va_to_pa asks the kernel, hk_va_walk_pa walks
+the tables here, and a null function means the walk. a caller that wants the
 destination checked before the store asks **hk_va_maps(unsigned long va,
 unsigned long pa)** and decides what to do with the answer.
 
@@ -103,9 +115,20 @@ instruction cache, leaves nothing mapped on any path including the failing
 ones, and returns 0 or a negative errno. all of them are process context, the
 calls sleep.
 
-**unsigned long hk_va_to_pa(unsigned long va)** translates an address, 0 when
-it cannot be translated, and **bool hk_va_maps(unsigned long va, unsigned long
-pa)** answers whether an address is mapped and carries that frame.
+**unsigned long hk_va_to_pa(unsigned long va)** translates the way the kernel's
+own patcher does: image addresses arithmetically, the linear map arithmetically,
+everything else through the kernel's vmalloc_to_pfn. a frame the kernel does not
+own is reported as 0 rather than handed back, which matters because that path
+answers a block mapped address with a null page before 5.13. **unsigned long
+hk_va_walk_pa(unsigned long va)** walks the tables here, asking none, bad and leaf
+in that order at every level, so a 2 MB or 1 GB block answers as correctly as a
+page. both return 0 when the address cannot be translated.
+
+**bool hk_va_writable(unsigned long va)** answers whether the mapping allows a
+store, read from the descriptor of the level that maps the address, and **bool
+hk_va_maps(unsigned long va, unsigned long pa)** answers whether the address is
+mapped and carries that frame. both are leaf aware, so a block mapped address is
+answered instead of being called unmapped.
 
 **int hk_patch_write(void *dst, unsigned long val)** writes one unsigned long
 through the configured path, which is what a table entry needs. -EINVAL on a
