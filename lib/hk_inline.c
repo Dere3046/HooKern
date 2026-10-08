@@ -717,6 +717,7 @@ static int hk_bti_guard_track(struct hk_inline *h, unsigned long addr)
 
 	guard = &h->guard[h->guard_count++];
 	guard->page = page;
+	guard->ptep = ptep;
 	guard->pte = pte;
 	guard->had_gp = true;
 	guard->active = true;
@@ -733,7 +734,9 @@ static void hk_bti_guard_restore(struct hk_inline *h)
 	for (i = 0; i < h->guard_count; i++) {
 		if (!h->guard[i].active)
 			continue;
-		ptep = (unsigned long *)h->guard[i].pte;
+		ptep = h->guard[i].ptep;
+		if (!ptep)
+			continue;
 		WRITE_ONCE(*ptep, h->guard[i].pte);
 		dsb(ish);
 		h->guard[i].active = false;
