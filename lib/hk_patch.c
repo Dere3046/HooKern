@@ -62,6 +62,34 @@ typedef struct vm_struct *(*find_vm_area_fn)(const void *addr);
 #define HK_WALK_P4D 3
 
 static unsigned long *hk_dst_pte(unsigned long addr);
+/*
+ * the range the kernel translates arithmetically when it patches: is_image_text is
+ * core_kernel_text, which is text and nothing else. rodata and data are not in it
+ * even though they are part of the image, and the kernel sends those to
+ * vmalloc_to_page, which is the whole reason this question exists
+ */
+static unsigned long g_stext;
+static unsigned long g_etext;
+static bool g_stext_read;
+
+static bool hk_core_text(unsigned long addr)
+{
+	unsigned long fn;
+
+	if (!g_stext_read) {
+		fn = hk_resolve("_stext");
+		if (fn && hk_ker_addr_ok(fn))
+			g_stext = fn;
+		fn = hk_resolve("_etext");
+		if (fn && hk_ker_addr_ok(fn))
+			g_etext = fn;
+		g_stext_read = true;
+	}
+	if (!g_stext || !g_etext)
+		return false;
+	return addr >= g_stext && addr < g_etext;
+}
+
 static bool hk_kernel_image_addr(unsigned long addr);
 static __nocfi noinline int hk_translate(unsigned long addr, unsigned long *out);
 
@@ -780,9 +808,29 @@ bool hk_patch_kernel_primitive_ok(unsigned long addr)
 	unsigned long phys = 0;
 	int level = HK_WALK_PTE;
 
+	/*
+	 * the kernel translates its own text arithmetically and never through
+	 * vmalloc_to_page, so text is safe whatever the mapping looks like
+	 */
+	if (hk_core_text(addr))
+		return true;
 	if (hk_walk_pa(addr, &phys, NULL, &level))
 		return true;
 	return level == HK_WALK_PTE;
+}
+
+/*
+ * the level an address is mapped at, for a caller that wants to judge a
+ * destination itself: 0 page, 1 pmd block, 2 pud block, 3 p4d block, -1 unknown
+ */
+int hk_va_level(unsigned long va)
+{
+	unsigned long phys = 0;
+	int level = HK_WALK_PTE;
+
+	if (hk_walk_pa(va, &phys, NULL, &level))
+		return -1;
+	return level;
 }
 
 int hk_write_kernel(void *dst, const void *src, size_t len)
@@ -791,6 +839,15 @@ int hk_write_kernel(void *dst, const void *src, size_t len)
 
 	if (!dst || !src || !len || (len & 3))
 		return -EINVAL;
+	/*
+	 * the kernel sends everything that is not its own text to vmalloc_to_page,
+	 * and that cannot answer a block mapped address before 5.13: it warns and
+	 * returns a null page, which the patcher turns into BUG_ON. those addresses
+	 * go through the library's own walk instead, so no caller has to know and
+	 * nothing warns
+	 */
+	if (!hk_patch_kernel_primitive_ok(addr))
+		return hk_write_fixmap(dst, src, len);
 	return hk_insn_patch_run(addr, src, len);
 }
 
