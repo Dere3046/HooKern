@@ -18,7 +18,8 @@
 
 struct hk_inline_guard {
 	unsigned long page;
-	unsigned long pte;
+	unsigned long *ptep;	/* the entry itself, the value alone is not writable */
+	unsigned long pte;	/* what the entry held before the bit was cleared */
 	bool had_gp;
 	bool active;
 };
