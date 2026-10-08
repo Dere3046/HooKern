@@ -45,6 +45,7 @@ int hk_write_direct(void *dst, const void *src, size_t len);
  */
 unsigned long hk_va_to_pa(unsigned long va);
 unsigned long hk_va_walk_pa(unsigned long va);
+int hk_va_level(unsigned long va);
 bool hk_va_writable(unsigned long va);
 bool hk_va_maps(unsigned long va, unsigned long pa);
 
