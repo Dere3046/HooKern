@@ -23,6 +23,8 @@
 
 #define HK_TRAMP_SIZE 4096
 #define HK_INS_LDR_X17 0x58000051
+#define HK_INS_LDR_X17_P12 0x58000071
+#define HK_INS_B_X12 0x14000003
 #define HK_INS_BR_X17 0xD61F0220
 #define HK_INS_RET_X17 0xD65F0220
 #define HK_INS_BLR_X17 0xD63F0220
@@ -318,16 +320,29 @@ static __nocfi int hk_relo_b(struct hk_relo_ctx *c, u32 insn,
 	return hk_relo_stub(c, addr, type != HK_INST_BL);
 }
 
+/*
+ * the immediate an adr or adrp carries, split across two fields: the high one has
+ * to be shifted into place before the low one joins it
+ */
+static __nocfi long hk_adr_imm(u32 insn)
+{
+	return hk_sext((((insn >> 5) & 0x7FFFF) << 2) | ((insn >> 29) & 0x3), 21);
+}
+
 static __nocfi int hk_relo_bl(struct hk_relo_ctx *c, u32 insn)
 {
 	u64 addr = c->inst_addr + hk_sext(insn & 0x03FFFFFF, 26) * 4;
 
 	addr = hk_relo_in_tramp(c, addr);
-	c->dst[c->count++] = HK_INS_LDR_X17;
+	/*
+	 * the call returns to the word after blr, so a branch has to sit there and
+	 * carry it over the literal, or the return lands inside it
+	 */
+	c->dst[c->count++] = HK_INS_LDR_X17_P12;
 	c->dst[c->count++] = HK_INS_BLR_X17;
+	c->dst[c->count++] = HK_INS_B_X12;
 	c->dst[c->count++] = addr & 0xFFFFFFFF;
 	c->dst[c->count++] = addr >> 32;
-	c->dst[c->count++] = HK_INS_NOP;
 	c->dst[c->count++] = HK_INS_NOP;
 	return 0;
 }
@@ -339,17 +354,19 @@ static __nocfi int hk_relo_adr(struct hk_relo_ctx *c, u32 insn,
 	u64 addr;
 
 	if (type == HK_INST_ADR) {
-		addr = c->inst_addr + hk_sext(((insn >> 5) & 0x7FFFF) |
-					      ((insn >> 29) & 0x3), 21);
+		addr = c->inst_addr + hk_adr_imm(insn);
 	} else {
+		/*
+		 * the immediate of adrp counts pages, so the byte offset is that
+		 * count times the page size, not the count itself
+		 */
 		addr = (c->inst_addr & ~0xFFFUL) +
-		       hk_sext((((insn >> 5) & 0x7FFFF) << 2) |
-			       ((insn >> 29) & 0x3), 21);
+		       (u64)(hk_adr_imm(insn) * 4096);
 		if (hk_in_tramp(c, addr))
 			return -EOPNOTSUPP;
 	}
 	c->dst[c->count++] = 0x58000040 | xd;
-	c->dst[c->count++] = 0x14000003;
+	c->dst[c->count++] = HK_INS_B_X12;
 	c->dst[c->count++] = addr & 0xFFFFFFFF;
 	c->dst[c->count++] = addr >> 32;
 	return 0;
