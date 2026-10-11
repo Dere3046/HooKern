@@ -5,6 +5,7 @@
 
 #include <linux/errno.h>
 #include <linux/list.h>
+#include <asm/tlbflush.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -721,8 +722,25 @@ static int hk_bti_guard_track(struct hk_inline *h, unsigned long addr)
 	guard->pte = pte;
 	guard->had_gp = true;
 	guard->active = true;
+	/*
+	 * the guarded bit is part of the translation, so the entry alone is not
+	 * enough: without the invalidation a cpu keeps the old translation and the
+	 * branch back into the middle of the function still trips BTI
+	 */
 	WRITE_ONCE(*ptep, pte & ~HK_PTE_GP);
+	__flush_tlb_kernel_pgtable(page);
 	dsb(ish);
+	isb();
+	if (READ_ONCE(*ptep) & HK_PTE_GP) {
+		/* the bit cannot be taken away here, so the hook must not be set up */
+		WRITE_ONCE(*ptep, pte);
+		__flush_tlb_kernel_pgtable(page);
+		dsb(ish);
+		isb();
+		guard->active = false;
+		h->guard_count--;
+		return -EFAULT;
+	}
 	return 0;
 }
 
@@ -738,7 +756,9 @@ static void hk_bti_guard_restore(struct hk_inline *h)
 		if (!ptep)
 			continue;
 		WRITE_ONCE(*ptep, h->guard[i].pte);
+		__flush_tlb_kernel_pgtable(h->guard[i].page);
 		dsb(ish);
+		isb();
 		h->guard[i].active = false;
 	}
 	h->guard_count = 0;
