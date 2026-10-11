@@ -86,6 +86,12 @@ translation itself for such an address, which is a page or a warning and never t
 BUG_ON, and returns -EOPNOTSUPP with a line naming hk_write_fixmap when the kernel
 cannot take it. nothing panics the machine for it.
 
+a hook that lands on a guarded page records what it had to do in
+`struct hk_inline.use_br_x17`: true means the jump back goes through `br x17` with
+the guarded bit taken off the page, false means it fell back to `ret x17`, which
+needs no landing pad at all. the library keeps the state and writes no log of its
+own, so a project that wants one reads the field after the hook is installed.
+
 **int hk_write_fixmap(void *dst, const void *src, size_t len)** writes byte
 wide, per page, through a slot this build maps itself, and translates with the
 library's own walk, which is the only route that answers a block mapped address
