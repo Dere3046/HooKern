@@ -7,7 +7,9 @@
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
+#include <linux/cpu.h>
 #include <linux/mm.h>
+#include <linux/uaccess.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/printk.h>
@@ -96,11 +98,30 @@ static __nocfi noinline int hk_translate(unsigned long addr, unsigned long *out)
 static int hk_walk_pa(unsigned long addr, unsigned long *out,
 		     unsigned long *desc, int *level);
 
+static int hk_slot_write(void *dst, const void *src, size_t len,
+			unsigned long (*to_pa)(unsigned long va), bool nofault);
+
 /*
  * an address the kernel's own patch_map would hand to vmalloc_to_page is every
  * address that is not core kernel text, which is the same test the kernel makes
  */
 static find_vm_area_fn g_find_vm_area;
+typedef int (*nofault_write_fn)(void *dst, const void *src, size_t len);
+static nofault_write_fn g_nofault_write;
+
+/*
+ * a store that cannot land has to come back as an error, and the helper that does
+ * it is resolved at run time like everything else here: the kernel does not export
+ * it, so naming it at link time would leave the module with a symbol the running
+ * kernel may not have
+ */
+static __nocfi noinline int call_nofault_write(void *dst, const void *src,
+					       size_t len)
+{
+	if (!g_nofault_write)
+		return -EOPNOTSUPP;
+	return g_nofault_write(dst, src, len);
+}
 static unsigned long (*g_vmalloc_to_pfn_fn)(const void *addr);
 static unsigned long g_kimage_voffset;
 static bool g_kimage_voffset_read;
@@ -180,6 +201,10 @@ void hk_patch_init(void)
 	 * test for the addresses its patcher translates arithmetically, and
 	 * vmalloc_to_page is asked directly for the block mapped ones
 	 */
+	fn = hk_resolve("copy_to_kernel_nofault");
+	if (fn && hk_ker_addr_ok(fn))
+		g_nofault_write = (nofault_write_fn)fn;
+
 	pr_info("[lkmhook] patch symbols ready, %d optional missing\n", missing);
 }
 
@@ -507,6 +532,8 @@ struct hk_patch_job {
 	int idx;
 	unsigned long caller;
 	unsigned long (*to_pa)(unsigned long va);
+	bool nofault;
+	bool kernel_slot;
 	atomic_t arrived;
 	int ret;
 	/*
@@ -523,7 +550,8 @@ struct hk_patch_job {
  */
 static int hk_patch_slot_run(unsigned long addr, const void *src, size_t len,
 			     int flags, int idx, unsigned long caller,
-			     unsigned long (*to_pa)(unsigned long va))
+			     unsigned long (*to_pa)(unsigned long va),
+			     bool nofault)
 {
 	size_t left = len;
 	int ret = 0;
@@ -536,8 +564,6 @@ static int hk_patch_slot_run(unsigned long addr, const void *src, size_t len,
 
 		phys = to_pa(addr);
 		if (!phys) {
-			pr_warn("[lkmhook] 0x%lx cannot be translated, refused\n",
-				addr);
 			ret = -ENOENT;
 			break;
 		}
@@ -553,10 +579,16 @@ static int hk_patch_slot_run(unsigned long addr, const void *src, size_t len,
 		}
 		opened = true;
 
-		memcpy((void *)dst, src, chunk);
-		dsb(ish);
+		if (nofault) {
+			ret = (int)call_nofault_write((void *)dst, src, chunk);
+		} else {
+			memcpy((void *)dst, src, chunk);
+			dsb(ish);
+		}
 		if (opened)
 			call_set_fixmap(idx, 0, __pgprot(0));
+		if (ret)
+			break;
 
 		ret = call_clean_inval(addr, addr + chunk);
 		if (ret)
@@ -588,7 +620,8 @@ static int hk_patch_slot_cb(void *data)
 		return 0;
 	}
 	job->ret = hk_patch_slot_run(job->addr, job->src, job->len, job->flags,
-				     job->idx, job->caller, job->to_pa);
+				     job->idx, job->caller, job->to_pa,
+				     job->nofault);
 	smp_store_release(&job->done, 1);
 	return job->ret;
 }
@@ -751,8 +784,284 @@ static __nocfi int hk_insn_write_run(unsigned long addr, const void *src,
  * library's own walk, which is the only one that is correct on a kernel whose
  * vmalloc_to_page predates leaf handling, so it is the default of hk_write_fixmap
  */
-int hk_write_fixmap_by(void *dst, const void *src, size_t len,
-		       unsigned long (*to_pa)(unsigned long va))
+/*
+ * the caller's translation, or the library's walk when it named none
+ */
+static unsigned long (*hk_write_to_pa(const struct hk_write *w))(unsigned long)
+{
+	if (w && w->to_pa)
+		return w->to_pa;
+	return hk_va_walk_pa;
+}
+
+/*
+ * the kernel's own poke slot, the same one its patcher maps through, so a platform
+ * that watches fixmap use sees what it expects. the target's own page is left
+ * alone: this is a mapping made here and it is writable whatever the target says
+ */
+static int hk_poke_run(struct hk_patch_job *job, const struct hk_write *w)
+{
+	unsigned long addr = job->addr;
+	const void *src = job->src;
+	size_t left = job->len;
+	int ret = 0;
+
+	lockdep_assert_held(&g_patch_lock);
+	cpus_read_lock();
+	while (left) {
+		unsigned long phys = hk_write_to_pa(w)(addr);
+		size_t chunk;
+		void *map;
+
+		if (!phys) {
+			ret = -ENOENT;
+			break;
+		}
+		chunk = min(left, PAGE_SIZE - (phys & ~PAGE_MASK));
+		ret = call_set_fixmap(FIX_TEXT_POKE0, phys & PAGE_MASK,
+				      PAGE_KERNEL);
+		if (ret)
+			break;
+		map = (void *)(__fix_to_virt(FIX_TEXT_POKE0) + (phys & ~PAGE_MASK));
+		if (w->nofault)
+			ret = (int)call_nofault_write(map, src, chunk);
+		else {
+			memcpy(map, src, chunk);
+			dsb(ish);
+		}
+		if (!ret)
+			ret = call_clean_inval(addr, addr + chunk);
+		call_set_fixmap(FIX_TEXT_POKE0, 0, __pgprot(0));
+		if (ret)
+			break;
+		addr += chunk;
+		src += chunk;
+		left -= chunk;
+	}
+	cpus_read_unlock();
+	return ret;
+}
+
+/*
+ * the page table entry that maps an address, and the level it was mapped at. a
+ * block mapping has no entry of its own, so the caller is told instead of being
+ * handed a descriptor of a different shape
+ */
+static pte_t *hk_va_pte(struct mm_struct *mm, unsigned long addr, int *level)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+
+	pgd = pgd_offset(mm, addr);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return NULL;
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return NULL;
+#if defined(p4d_leaf)
+	if (p4d_leaf(*p4d)) {
+		*level = HK_WALK_P4D;
+		return NULL;
+	}
+#endif
+	pud = pud_offset(p4d, addr);
+	if (pud_none(*pud) || pud_bad(*pud))
+		return NULL;
+#if defined(pud_leaf)
+	if (pud_leaf(*pud)) {
+		*level = HK_WALK_PUD;
+		return NULL;
+	}
+#endif
+	pmd = pmd_offset(pud, addr);
+	if (pmd_none(*pmd))
+		return NULL;
+#if defined(pmd_leaf)
+	if (pmd_leaf(*pmd)) {
+		*level = HK_WALK_PMD;
+		return NULL;
+	}
+#endif
+	if (pmd_bad(*pmd))
+		return NULL;
+	*level = HK_WALK_PTE;
+	return pte_offset_kernel(pmd, addr);
+}
+
+/*
+ * the write bits of an entry, and only those: the read only bit is cleared and the
+ * software write bit is set, so what the store dirties is kept and the entry can be
+ * put back by clearing the write bits again. a caller whose kernel needs something
+ * else here names its own through the descriptor
+ */
+static pte_t hk_pte_make_write(const struct hk_write *w, pte_t pte)
+{
+	pteval_t bits;
+
+	if (w->mkwrite)
+		return w->mkwrite(pte);
+	bits = pte_val(pte);
+	bits &= ~PTE_RDONLY;
+	bits |= PTE_WRITE;
+	return __pte(bits);
+}
+
+/*
+ * the kernel side invalidation. an address space of the caller's own is its
+ * business, so its flush comes in through the descriptor
+ */
+static void hk_flush_tlb_page(unsigned long addr);
+
+static void hk_flush_va(const struct hk_write *w, struct mm_struct *mm,
+			unsigned long addr)
+{
+	if (w->flush)
+		w->flush(mm, addr);
+	else
+		hk_flush_tlb_page(addr);
+}
+
+static void hk_flush_tlb_page(unsigned long addr)
+{
+	__flush_tlb_kernel_pgtable(addr);
+	dsb(ish);
+	isb();
+}
+
+/*
+ * the target's own entry is made writable for the store and only that bit is put
+ * back, so the dirty and young bits the store sets are kept. a platform that
+ * watches fixmap use sees nothing here, which is what this route is for
+ */
+static int hk_own_run(void *dst, const void *src, size_t len,
+		      const struct hk_write *w,
+		      int (*fn)(void *ctx, void *addr, size_t len), void *ctx)
+{
+	struct mm_struct *mm = w->mm;
+	unsigned long addr = (unsigned long)dst;
+	int ret = 0;
+
+	if (!mm) {
+		mm = (struct mm_struct *)hk_resolve("init_mm");
+		if (!mm || !hk_ker_addr_ok((unsigned long)mm))
+			return -ENOENT;
+	}
+
+	/*
+	 * a caller that stores its own way gets one window over the page it named,
+	 * which is what a foreign address space needs, and the store is the whole of
+	 * it. the write bits are the only ones that move, so what the store dirties
+	 * is kept when the entry goes back
+	 */
+	while (len) {
+		unsigned long off = addr & ~PAGE_MASK;
+		size_t chunk = min(len, PAGE_SIZE - off);
+		int level = HK_WALK_PTE;
+		pte_t *ptep = hk_va_pte(mm, addr, &level);
+		pte_t old;
+		bool was_ro;
+
+		if (!ptep) {
+			ret = level == HK_WALK_PTE ? -ENOENT : -EOPNOTSUPP;
+			break;
+		}
+		old = READ_ONCE(*ptep);
+		was_ro = !pte_write(old);
+		WRITE_ONCE(*ptep, hk_pte_make_write(w, pte_mkdirty(old)));
+		hk_flush_va(w, mm, addr);
+		if (fn)
+			ret = fn(ctx, (void *)addr, chunk);
+		else if (w->nofault)
+			ret = call_nofault_write((void *)addr, src, chunk);
+		else {
+			memcpy((void *)addr, src, chunk);
+			dsb(ish);
+		}
+		if (was_ro)
+			WRITE_ONCE(*ptep, pte_wrprotect(READ_ONCE(*ptep)));
+		hk_flush_va(w, mm, addr);
+		if (!ret)
+			ret = call_clean_inval(addr, addr + chunk);
+		if (ret)
+			break;
+		addr += chunk;
+		src += chunk;
+		len -= chunk;
+	}
+	return ret;
+}
+
+int hk_write_window(void *dst, const void *src, size_t len,
+		    const struct hk_write *w,
+		    int (*fn)(void *ctx, void *addr, size_t len), void *ctx)
+{
+	struct hk_write o = { .slot = HK_SLOT_OWN };
+	int ret;
+
+	if (!dst || (!src && !fn) || (!len && !fn))
+		return -EINVAL;
+	if (w)
+		o = *w;
+	if (o.slot != HK_SLOT_OWN) {
+		if (fn)
+			return -EOPNOTSUPP;
+		return hk_write_run(dst, src, len, &o);
+	}
+	mutex_lock(&g_patch_lock);
+	ret = hk_own_run(dst, src, len, &o, fn, ctx);
+	mutex_unlock(&g_patch_lock);
+	if (!ret && !fn && o.verify && memcmp(dst, src, len))
+		ret = -EIO;
+	return ret;
+}
+
+int hk_write_run(void *dst, const void *src, size_t len,
+		 const struct hk_write *w)
+{
+	struct hk_write o = { };
+	int ret;
+
+	if (!dst || !src || !len)
+		return -EINVAL;
+	if (w)
+		o = *w;
+	if (o.slot == HK_SLOT_OWN) {
+		mutex_lock(&g_patch_lock);
+		ret = hk_own_run(dst, src, len, &o, NULL, NULL);
+		mutex_unlock(&g_patch_lock);
+	} else if (o.slot == HK_SLOT_KERNEL) {
+		struct hk_patch_job job = {
+			.addr = (unsigned long)dst,
+			.src = src,
+			.len = len,
+			.to_pa = hk_write_to_pa(&o),
+			.nofault = o.nofault,
+		};
+
+		mutex_lock(&g_patch_lock);
+		ret = hk_poke_run(&job, &o);
+		mutex_unlock(&g_patch_lock);
+	} else {
+		ret = hk_slot_write(dst, src, len, hk_write_to_pa(&o),
+				    o.nofault);
+	}
+	if (!ret && o.verify && memcmp(dst, src, len))
+		ret = -EIO;
+	return ret;
+}
+
+int hk_write_poke(void *dst, const void *src, size_t len)
+{
+	const struct hk_write w = { .slot = HK_SLOT_KERNEL,
+				    .nofault = true, .verify = true };
+
+	return hk_write_run(dst, src, len, &w);
+}
+
+static int hk_slot_write(void *dst, const void *src, size_t len,
+			unsigned long (*to_pa)(unsigned long va), bool nofault)
 {
 	struct hk_patch_job job;
 	unsigned long addr = (unsigned long)dst;
@@ -773,13 +1082,14 @@ int hk_write_fixmap_by(void *dst, const void *src, size_t len,
 	job.flags = 0;
 	job.caller = caller;
 	job.to_pa = to_pa ? to_pa : hk_va_walk_pa;
+	job.nofault = nofault;
 	atomic_set(&job.arrived, 0);
 	job.done = 0;
 	job.ret = 0;
 
 	if (len <= 4) {
 		ret = hk_patch_slot_run(addr, src, len, 0, job.idx, caller,
-					job.to_pa);
+					job.to_pa, nofault);
 	} else {
 		struct hk_patch_job saved = job;
 
@@ -791,6 +1101,12 @@ int hk_write_fixmap_by(void *dst, const void *src, size_t len,
 out:
 	mutex_unlock(&g_patch_lock);
 	return ret;
+}
+
+int hk_write_fixmap_by(void *dst, const void *src, size_t len,
+		       unsigned long (*to_pa)(unsigned long va))
+{
+	return hk_slot_write(dst, src, len, to_pa, false);
 }
 
 int hk_write_fixmap(void *dst, const void *src, size_t len)

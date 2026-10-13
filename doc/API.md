@@ -86,11 +86,36 @@ translation itself for such an address, which is a page or a warning and never t
 BUG_ON, and returns -EOPNOTSUPP with a line naming hk_write_fixmap when the kernel
 cannot take it. nothing panics the machine for it.
 
+the descriptor also names where the store goes: HK_SLOT_LIBRARY (the slot this
+library owns), HK_SLOT_KERNEL (FIX_TEXT_POKE0, the one the kernel's patcher maps
+through, written under stop_machine) and HK_SLOT_OWN (the target's own entry, made
+writable with the write bits alone and put back the same way, so the store still
+dirties the page and no fixmap is touched). mm names an address space of the
+caller's own, flush its invalidation, and mkwrite its way of granting the write.
+**int hk_write_window(void *dst, const void *src, size_t len, const struct hk_write
+*w, int (*fn)(void *ctx, void *addr, size_t len), void *ctx)** runs that window and
+lets the caller store its own way, once per page over the range.
+
 a hook that lands on a guarded page records what it had to do in
 `struct hk_inline.use_br_x17`: true means the jump back goes through `br x17` with
 the guarded bit taken off the page, false means it fell back to `ret x17`, which
 needs no landing pad at all. the library keeps the state and writes no log of its
 own, so a project that wants one reads the field after the hook is installed.
+
+**int hk_write_run(void *dst, const void *src, size_t len, const struct hk_write
+*w)** is the same write with every mechanism named by the caller: the translation
+(hk_va_walk_pa, hk_va_to_pa, or one of its own, a null one meaning the library's
+walk), the slot (HK_SLOT_LIBRARY, the library's own, or HK_SLOT_KERNEL, the one the
+kernel's patcher maps through), whether a store that cannot land is an error, and
+whether the target is read back afterwards. a zeroed descriptor is the library's own
+route with no read back. **int hk_write_poke(...)** is the kernel slot with the
+fault tolerant store and the read back, which is the route a platform that watches
+fixmap use expects to see.
+
+every write returns 0 only when the bytes are in the target, -ENOENT when the
+address cannot be translated, -EIO when they were written and did not land, and
+-EOPNOTSUPP when the route does not fit the address. the library writes no log of
+its own, so a caller that wants one reads the return value.
 
 **int hk_write_fixmap(void *dst, const void *src, size_t len)** writes byte
 wide, per page, through a slot this build maps itself, and translates with the

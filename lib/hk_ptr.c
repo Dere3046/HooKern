@@ -83,12 +83,23 @@ int hk_ptr_hook(void **slot, void *replacement, void **orig_out)
 	spin_unlock_irqrestore(&g_ptr_lock, flags);
 
 	ret = hk_patch_write(slot, (unsigned long)replacement);
+	if (!ret) {
+		void *now;
+
+		/*
+		 * the slot is read back before the hook is reported as taken: a write a
+		 * platform swallowed leaves the pointer where it was, and a caller has to
+		 * hear about that rather than believe the hook is in place
+		 */
+		if (copy_from_kernel_nofault(&now, slot, sizeof(now)) ||
+		    now != replacement)
+			ret = -EIO;
+	}
 	if (ret) {
 		spin_lock_irqsave(&g_ptr_lock, flags);
 		list_del(&new->list);
 		spin_unlock_irqrestore(&g_ptr_lock, flags);
 		kfree(new);
-		pr_warn("[lkmhook] ptr hook %px write failed %d\n", slot, ret);
 		return ret;
 	}
 

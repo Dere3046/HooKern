@@ -34,6 +34,38 @@
 int hk_write_text(void *dst, const void *src, size_t len);
 int hk_write_kernel(void *dst, const void *src, size_t len);
 int hk_write_one(void *dst, u32 insn);
+/*
+ * what one write is made of. every field is the caller's choice: a translation of
+ * its own or one of the library's, the library's slot or the kernel's, a plain
+ * store or a fault tolerant one, and whether the result has to be read back. a
+ * zeroed descriptor is the library's own route and the read back is off
+ */
+#define HK_SLOT_LIBRARY 0
+#define HK_SLOT_KERNEL 1
+#define HK_SLOT_OWN 2
+
+struct hk_write {
+	struct mm_struct *mm;
+	unsigned long (*to_pa)(unsigned long va);
+	void (*flush)(struct mm_struct *mm, unsigned long va);
+	pte_t (*mkwrite)(pte_t pte);
+	int slot;
+	bool nofault;
+	bool verify;
+};
+
+int hk_write_run(void *dst, const void *src, size_t len,
+		 const struct hk_write *w);
+int hk_write_poke(void *dst, const void *src, size_t len);
+/*
+ * the write bits of a mapping held open for a caller that stores its own way. a null
+ * fn means the store is done here through the same descriptor, so a caller with a
+ * foreign address space runs its own store inside and a caller with one of its own
+ * takes the store here
+ */
+int hk_write_window(void *dst, const void *src, size_t len,
+		    const struct hk_write *w,
+		    int (*fn)(void *ctx, void *addr, size_t len), void *ctx);
 int hk_write_fixmap(void *dst, const void *src, size_t len);
 int hk_write_fixmap_by(void *dst, const void *src, size_t len,
 		       unsigned long (*to_pa)(unsigned long va));
@@ -48,6 +80,8 @@ unsigned long hk_va_walk_pa(unsigned long va);
 int hk_va_level(unsigned long va);
 bool hk_va_writable(unsigned long va);
 bool hk_va_maps(unsigned long va, unsigned long pa);
+bool hk_va_maps_by(unsigned long va, unsigned long pa,
+		   unsigned long (*to_pa)(unsigned long va));
 
 void hk_flush_icache(unsigned long addr);
 void hk_flush_dcache(unsigned long addr, size_t len);
