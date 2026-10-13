@@ -76,6 +76,16 @@ void hk_inline_exit(void);
 unsigned int hk_inline_pending(void);
 
 /*
+ * one tasks rcu grace period: what has to pass between the moment code of this
+ * module is taken out of a path another core could be running and the moment it is
+ * freed. it is the flavour the kernel uses for its own text pokes, the symbol is
+ * resolved here, and a kernel without it says so once instead of waiting for
+ * nothing. the call inside is indirect and cfi is off for it, a direct call from a
+ * consumer needs nothing
+ */
+void hk_wait_tasks_rcu(void);
+
+/*
  * what the entry of a probe target looks like from the outside. everything
  * except plain means the window should not be patched as it stands
  */

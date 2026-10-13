@@ -49,6 +49,13 @@ struct hk_write {
 	unsigned long (*to_pa)(unsigned long va);
 	void (*flush)(struct mm_struct *mm, unsigned long va);
 	pte_t (*mkwrite)(pte_t pte);
+	/*
+	 * the same freedom the alias routes give through to_pa, for the route that writes
+	 * through the target's own entry: it has to find that entry first, and a caller
+	 * that wants to find it its own way says so here. a null one is the library's own
+	 * walk, and the library neither checks nor second guesses what it is given
+	 */
+	pte_t *(*pte_of)(struct mm_struct *mm, unsigned long va, int *level);
 	int slot;
 	bool nofault;
 	bool verify;
@@ -77,6 +84,20 @@ int hk_write_direct(void *dst, const void *src, size_t len);
  */
 unsigned long hk_va_to_pa(unsigned long va);
 unsigned long hk_va_walk_pa(unsigned long va);
+/*
+ * which family an address belongs to. the family is what decides how a write has to
+ * be made, so a caller that wants to choose its own route asks this first instead of
+ * guessing from the value. the library never uses it to pick a route by itself
+ */
+enum hk_va_kind {
+	HK_VA_IMAGE_TEXT = 0,	/* the kernel's own patcher translates this arithmetically */
+	HK_VA_IMAGE_DATA,	/* image rodata and data: its patcher sends these to vmalloc_to_page */
+	HK_VA_LINEAR,		/* the linear map: read only data has a read only alias here too */
+	HK_VA_VMALLOC,		/* vmalloc and module memory */
+	HK_VA_USER,
+};
+
+int hk_va_kind(unsigned long va);
 int hk_va_level(unsigned long va);
 bool hk_va_writable(unsigned long va);
 bool hk_va_maps(unsigned long va, unsigned long pa);

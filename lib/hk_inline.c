@@ -986,7 +986,12 @@ void hk_inline_free(struct hk_inline *h)
 
 typedef void (*hk_synchronize_rcu_tasks_fn)(void);
 
-static __nocfi void hk_inline_synchronize_rcu_tasks(void)
+/*
+ * __nocfi on the body, not decoration: the symbol is resolved at runtime and the
+ * call is indirect, and the cfi typeid the compiler would check it against is not
+ * the one the kernel recorded. 5.10 panics on it, the target named in the message
+ */
+__nocfi void hk_wait_tasks_rcu(void)
 {
 	hk_synchronize_rcu_tasks_fn fn;
 	unsigned long sym = hk_resolve("synchronize_rcu_tasks");
@@ -1054,7 +1059,7 @@ void hk_inline_unhook(struct hk_inline *h)
 			h->name ? h->name : "?");
 		return;
 	}
-	hk_inline_synchronize_rcu_tasks();
+	hk_wait_tasks_rcu();
 	hk_inline_free(h);
 	h->pending = false;
 	hk_inline_pending_del(h);
@@ -1090,7 +1095,7 @@ void hk_inline_exit(void)
 			list_add(&ent->list, &work);
 			continue;
 		}
-		hk_inline_synchronize_rcu_tasks();
+		hk_wait_tasks_rcu();
 		hk_inline_free(ent->hook);
 		ent->hook->pending = false;
 		kfree(ent);

@@ -141,7 +141,7 @@ void hk_exit_block(void)
 	unsigned int left;
 
 	for (;;) {
-		left = hk_inline_pending() + hk_ptr_pending();
+		left = hk_inline_pending() + hk_ptr_pending() + hk_kprobe_pending();
 		if (!left)
 			break;
 		pr_warn("[lkmhook] exit blocked, %u hook(s) still live\n", left);

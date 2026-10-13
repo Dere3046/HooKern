@@ -106,6 +106,19 @@ static int hk_slot_write(void *dst, const void *src, size_t len,
  * address that is not core kernel text, which is the same test the kernel makes
  */
 static find_vm_area_fn g_find_vm_area;
+
+/*
+ * a resolved kernel symbol cannot be called from a checked site on the old cfi
+ * builds, the type clang recorded for it is not the one the cast produces, so the
+ * call lives behind a wrapper whose body is off, the same shape every other
+ * resolved call in this file has
+ */
+static __nocfi noinline struct vm_struct *call_find_vm_area(const void *addr)
+{
+	if (!g_find_vm_area)
+		return NULL;
+	return g_find_vm_area(addr);
+}
 typedef int (*nofault_write_fn)(void *dst, const void *src, size_t len);
 static nofault_write_fn g_nofault_write;
 
@@ -959,7 +972,10 @@ static int hk_own_run(void *dst, const void *src, size_t len,
 		unsigned long off = addr & ~PAGE_MASK;
 		size_t chunk = min(len, PAGE_SIZE - off);
 		int level = HK_WALK_PTE;
-		pte_t *ptep = hk_va_pte(mm, addr, &level);
+		pte_t *ptep;
+
+		ptep = w->pte_of ? w->pte_of(mm, addr, &level) :
+				   hk_va_pte(mm, addr, &level);
 		pte_t old;
 		bool was_ro;
 
@@ -1139,6 +1155,25 @@ bool hk_patch_kernel_primitive_ok(unsigned long addr)
  * the level an address is mapped at, for a caller that wants to judge a
  * destination itself: 0 page, 1 pmd block, 2 pud block, 3 p4d block, -1 unknown
  */
+int hk_va_kind(unsigned long va)
+{
+	unsigned long phys = 0;
+
+	if (hk_core_text(va))
+		return HK_VA_IMAGE_TEXT;
+	if (hk_kernel_image_addr(va))
+		return HK_VA_IMAGE_DATA;
+	if (!va)
+		return HK_VA_USER;
+	if (call_find_vm_area((const void *)va))
+		return HK_VA_VMALLOC;
+	if (hk_walk_pa(va, &phys, NULL, NULL) == 0)
+		return HK_VA_LINEAR;
+	if (va < TASK_SIZE)
+		return HK_VA_USER;
+	return HK_VA_LINEAR;
+}
+
 int hk_va_level(unsigned long va)
 {
 	unsigned long phys = 0;

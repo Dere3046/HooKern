@@ -33,6 +33,9 @@ struct hk_kprobe_node {
 static LIST_HEAD(g_kprobes);
 static DEFINE_SPINLOCK(g_kprobe_lock);
 
+/* a probe that unregister_kprobe cannot take back keeps reaching into this module */
+static unsigned int g_kprobe_stuck;
+
 struct hk_blacklist_saved {
 	struct kprobe_blacklist_entry *entry;
 	unsigned long start_addr;
@@ -109,24 +112,9 @@ static __nocfi unsigned long call_ftrace_location(unsigned long addr)
  * the address gates of register_kprobe in its own order. every one of them
  * comes back as -EINVAL, so the caller has to be told which one fired
  */
-static __nocfi enum hk_kprobe_state hk_kprobe_gate(const char *sym,
-						   unsigned long *addr,
-						   const char **reason)
+static __nocfi enum hk_kprobe_state hk_kprobe_gate_addr(unsigned long a,
+							const char **reason)
 {
-	unsigned long a;
-
-	a = *sym ? hk_resolve(sym) : 0;
-	if (!a) {
-		*addr = 0;
-		*reason = "symbol not resolved";
-		return HK_KPROBE_UNRESOLVED;
-	}
-	*addr = a;
-
-	if (str_has_prefix(sym, "__cfi_") || str_has_prefix(sym, "__pfx_")) {
-		*reason = "cfi preamble symbol";
-		return HK_KPROBE_UNSUPPORTED;
-	}
 	if (!call_text_addr(a)) {
 		*reason = "not kernel text";
 		return HK_KPROBE_UNSUPPORTED;
@@ -146,6 +134,27 @@ static __nocfi enum hk_kprobe_state hk_kprobe_gate(const char *sym,
 	return HK_KPROBE_OK;
 }
 
+static __nocfi enum hk_kprobe_state hk_kprobe_gate(const char *sym,
+						   unsigned long *addr,
+						   const char **reason)
+{
+	unsigned long a;
+
+	a = *sym ? hk_resolve(sym) : 0;
+	if (!a) {
+		*addr = 0;
+		*reason = "symbol not resolved";
+		return HK_KPROBE_UNRESOLVED;
+	}
+	*addr = a;
+
+	if (str_has_prefix(sym, "__cfi_") || str_has_prefix(sym, "__pfx_")) {
+		*reason = "cfi preamble symbol";
+		return HK_KPROBE_UNSUPPORTED;
+	}
+	return hk_kprobe_gate_addr(a, reason);
+}
+
 int hk_kprobe_check(const char *sym, struct hk_kprobe_report *out)
 {
 	if (!sym || !out)
@@ -156,71 +165,137 @@ int hk_kprobe_check(const char *sym, struct hk_kprobe_report *out)
 	return 0;
 }
 
+int hk_kprobe_check_at(unsigned long addr, struct hk_kprobe_report *out)
+{
+	if (!addr || !out)
+		return -EINVAL;
+
+	memset(out, 0, sizeof(*out));
+	out->addr = addr;
+	out->state = hk_kprobe_gate_addr(addr, &out->reason);
+	return 0;
+}
+
+/* an address and a symbol read the same in a log, one of them is just longer */
+static void hk_kprobe_label(const struct hk_kprobe *h, char *buf, size_t len)
+{
+	if (h->kp.symbol_name)
+		strscpy(buf, h->kp.symbol_name, len);
+	else
+		snprintf(buf, len, "0x%lx", (unsigned long)h->kp.addr);
+}
+
 /* a refused install names the symbol and the gate, never a bare errno */
-static void hk_kprobe_fail(const char *sym, int ret)
+static void hk_kprobe_fail(const char *label, int ret,
+			   const struct hk_kprobe_report *rep)
+{
+	pr_warn("[lkmhook] kprobe %s failed %d %s\n", label, ret, rep->reason);
+}
+
+/*
+ * the gate is asked only after the kernel refused, so a successful install costs
+ * no resolver walk, and the label is the symbol for one route and the address for
+ * the other because that is all either of them has
+ */
+static void hk_kprobe_fail_route(const struct hk_kprobe *h, int ret)
 {
 	struct hk_kprobe_report rep;
+	char label[48];
 
-	if (hk_kprobe_check(sym, &rep))
+	hk_kprobe_label(h, label, sizeof(label));
+	if (h->kp.symbol_name) {
+		if (!hk_kprobe_check(h->kp.symbol_name, &rep))
+			hk_kprobe_fail(label, ret, &rep);
 		return;
-	pr_warn("[lkmhook] kprobe %s failed %d %s\n", sym, ret, rep.reason);
+	}
+	if (!hk_kprobe_check_at((unsigned long)h->kp.addr, &rep))
+		hk_kprobe_fail(label, ret, &rep);
 }
 
 /* an unregistered probe on module text is a use after free, say so */
-static void hk_kprobe_drop(struct hk_kprobe *h)
+static int hk_kprobe_drop(struct hk_kprobe *h)
 {
+	char label[48];
+
 	if (!call_unregister_kprobe(&h->kp))
-		return;
+		return 0;
+
+	hk_kprobe_label(h, label, sizeof(label));
 	pr_warn("[lkmhook] kprobe %s left registered, unregister_kprobe unresolved\n",
-		h->kp.symbol_name ? h->kp.symbol_name : "?");
+		label);
+	return -ENODATA;
 }
 
-int hk_kprobe_install(struct hk_kprobe *h, const char *sym,
-		      kprobe_pre_handler_t pre)
+/* allocate the node, register and track: the two installs differ in one field */
+static int hk_kprobe_add(struct hk_kprobe *h, unsigned long addr)
 {
 	struct hk_kprobe_node *node;
 	unsigned long flags;
+	char label[48];
 	int ret;
-
-	if (!h || !sym || !pre)
-		return -EINVAL;
 
 	node = kzalloc(sizeof(*node), GFP_KERNEL);
 	if (!node) {
+		hk_kprobe_label(h, label, sizeof(label));
 		pr_warn("[lkmhook] kprobe %s failed -ENOMEM, no tracking node\n",
-			sym);
+			label);
 		return -ENOMEM;
 	}
-
-	memset(h, 0, sizeof(*h));
-	h->kp.symbol_name = sym;
-	h->kp.pre_handler = pre;
 
 	ret = call_register_kprobe(&h->kp);
 	if (ret < 0) {
 		kfree(node);
-		hk_kprobe_fail(sym, ret);
+		hk_kprobe_fail_route(h, ret);
 		return ret;
 	}
 	h->orig = (unsigned long)h->kp.addr;
+	if (!h->orig)
+		h->orig = addr;
 
 	node->hook = h;
 	spin_lock_irqsave(&g_kprobe_lock, flags);
 	list_add(&node->list, &g_kprobes);
 	spin_unlock_irqrestore(&g_kprobe_lock, flags);
 
-	pr_info("[lkmhook] kprobe %s @ 0x%lx\n", sym, h->orig);
+	hk_kprobe_label(h, label, sizeof(label));
+	pr_info("[lkmhook] kprobe %s @ 0x%lx\n", label, h->orig);
 	return 0;
 }
 
-void hk_kprobe_remove(struct hk_kprobe *h)
+int hk_kprobe_install(struct hk_kprobe *h, const char *sym,
+		      kprobe_pre_handler_t pre)
+{
+	if (!h || !sym || !pre)
+		return -EINVAL;
+
+	memset(h, 0, sizeof(*h));
+	h->kp.symbol_name = sym;
+	h->kp.pre_handler = pre;
+
+	return hk_kprobe_add(h, 0);
+}
+
+int hk_kprobe_install_at(struct hk_kprobe *h, unsigned long addr,
+			 kprobe_pre_handler_t pre)
+{
+	if (!h || !addr || !pre)
+		return -EINVAL;
+
+	memset(h, 0, sizeof(*h));
+	h->kp.addr = (kprobe_opcode_t *)addr;
+	h->kp.pre_handler = pre;
+
+	return hk_kprobe_add(h, addr);
+}
+
+int hk_kprobe_remove(struct hk_kprobe *h)
 {
 	struct hk_kprobe_node *node;
 	struct hk_kprobe_node *found = NULL;
 	unsigned long flags;
 
 	if (!h)
-		return;
+		return -EINVAL;
 
 	spin_lock_irqsave(&g_kprobe_lock, flags);
 	list_for_each_entry(node, &g_kprobes, list) {
@@ -234,11 +309,11 @@ void hk_kprobe_remove(struct hk_kprobe *h)
 
 	/* not tracked means not registered, a second remove is a no op */
 	if (!found)
-		return;
+		return 0;
 
 	/* unregister sleeps, it stays outside the list lock */
-	hk_kprobe_drop(h);
 	kfree(found);
+	return hk_kprobe_drop(h);
 }
 
 int hk_kprobe_clear_blacklist(void)
@@ -333,10 +408,16 @@ void hk_kprobe_exit(void)
 	spin_unlock_irqrestore(&g_kprobe_lock, flags);
 
 	list_for_each_entry_safe(node, tmp, &pending, list) {
-		hk_kprobe_drop(node->hook);
+		if (hk_kprobe_drop(node->hook))
+			g_kprobe_stuck++;
 		list_del(&node->list);
 		kfree(node);
 	}
 
 	hk_kprobe_restore_blacklist();
+}
+
+unsigned int hk_kprobe_pending(void)
+{
+	return READ_ONCE(g_kprobe_stuck);
 }

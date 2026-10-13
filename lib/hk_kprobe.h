@@ -42,10 +42,29 @@ struct hk_kprobe {
  */
 int hk_kprobe_install(struct hk_kprobe *h, const char *sym,
 		      kprobe_pre_handler_t pre);
-/* unregister and drop the tracking node, a second remove is a no op */
-void hk_kprobe_remove(struct hk_kprobe *h);
+/*
+ * the same for a target the caller holds as an address: a table entry it read
+ * itself, or a function whose name it does not want the resolver to see. addr has
+ * to be kernel or module text, which is the same gate the kernel asks, and every
+ * other gate, the count of live probes and the exit path are the ones above
+ */
+int hk_kprobe_install_at(struct hk_kprobe *h, unsigned long addr,
+			 kprobe_pre_handler_t pre);
+/*
+ * unregister and drop the tracking node, a second remove is a no op. 0 when the
+ * probe is gone, -ENODATA when unregister_kprobe cannot be reached and the probe
+ * is still armed, which is what a caller that owns the code behind it has to know
+ */
+int hk_kprobe_remove(struct hk_kprobe *h);
 /* unregister every tracked probe, called by hk_exit */
 void hk_kprobe_exit(void);
+/*
+ * probes the exit sweep could not take back, which are the ones whose handler is
+ * still reached from kernel text: a module that owns such a probe must not be
+ * unmapped, and this is what hk_exit_block counts. a remove the caller runs itself
+ * answers the same question in its return value and does not add to this
+ */
+unsigned int hk_kprobe_pending(void);
 
 /* drop the blacklist entries, every probe refused with HK_KPROBE_BLACKLISTED
  * needs this first, hk_kprobe_exit restores them */
@@ -83,6 +102,8 @@ struct hk_kprobe_report {
  * same gates guard a kretprobe, register_kretprobe registers a kprobe
  */
 int hk_kprobe_check(const char *sym, struct hk_kprobe_report *out);
+/* the same gates on an address, for a target that was never a symbol */
+int hk_kprobe_check_at(unsigned long addr, struct hk_kprobe_report *out);
 
 /*
  * argument and return helpers for a handler on arm64. x0 to x7 carry the first
@@ -145,6 +166,24 @@ static inline void hk_regs_skip(struct pt_regs *regs)
 static inline void hk_regs_return(struct pt_regs *regs)
 {
 	regs->pc = regs->regs[30];
+}
+
+/*
+ * hand the call to another function instead of running the probed instruction: the
+ * replacement is entered with the argument registers of the target, on the target's
+ * caller stack, and its return goes to the caller of the target, so what it returns
+ * is what the target returns. it is reached by the return from the breakpoint
+ * exception and not by a branch, so no bti landing pad and no cfi check stands at
+ * its entry, and the target never runs unless the replacement calls it
+ *
+ * a handler that redirects returns 1, exactly like one that parks the pc. reaching
+ * the original again is the address of the probed entry: the breakpoint fires a
+ * second time and the handler has to let that call through, which is what the guard
+ * of hk_redir is for
+ */
+static inline void hk_regs_redirect(struct pt_regs *regs, unsigned long fn)
+{
+	regs->pc = fn;
 }
 
 #endif

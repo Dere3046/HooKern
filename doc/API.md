@@ -91,7 +91,8 @@ library owns), HK_SLOT_KERNEL (FIX_TEXT_POKE0, the one the kernel's patcher maps
 through, written under stop_machine) and HK_SLOT_OWN (the target's own entry, made
 writable with the write bits alone and put back the same way, so the store still
 dirties the page and no fixmap is touched). mm names an address space of the
-caller's own, flush its invalidation, and mkwrite its way of granting the write.
+caller's own, flush its invalidation, mkwrite its way of granting the write, and
+pte_of the way it finds that entry, a null one being the library's own walk.
 **int hk_write_window(void *dst, const void *src, size_t len, const struct hk_write
 *w, int (*fn)(void *ctx, void *addr, size_t len), void *ctx)** runs that window and
 lets the caller store its own way, once per page over the range.
@@ -154,6 +155,19 @@ answers a block mapped address with a null page before 5.13. **unsigned long
 hk_va_walk_pa(unsigned long va)** walks the tables here, asking none, bad and leaf
 in that order at every level, so a 2 MB or 1 GB block answers as correctly as a
 page. both return 0 when the address cannot be translated.
+
+**int hk_va_kind(unsigned long va)** answers which family an address belongs to:
+image text, image data (rodata and data, which the kernel's own patcher sends to
+vmalloc_to_page), the linear map (where read only data has a read only alias as
+well), vmalloc and module memory, or user. the family is what decides how a write
+has to be made, so a caller that picks its own route asks this first rather than
+guessing from the value; the library never picks a route from it by itself.
+
+the route that writes through the target's own entry needs that entry, and a
+mapping built from a block descriptor has none: the kernel image is mapped that
+way at the 2 MB level, so that route answers HK_SLOT_OWN destinations in image
+rodata and image text with -EOPNOTSUPP instead of writing somewhere else, which
+is the same freedom pte_of hands a caller that finds entries its own way.
 
 **bool hk_va_writable(unsigned long va)** answers whether the mapping allows a
 store, read from the descriptor of the level that maps the address, and **bool
@@ -393,6 +407,14 @@ struct hk_kprobe {
 };
 ```
 
+**int hk_kprobe_install_at(struct hk_kprobe *h, unsigned long addr, kprobe_pre_handler_t pre)**
+
+the same for a target the caller holds as an address: a syscall table
+entry it read itself, or a function whose name it does not want the
+resolver to see. addr has to be kernel or module text, which is the same
+gate the kernel asks, and the tracking, the count of live probes and the
+exit path are the ones hk_kprobe_install uses. h->orig is addr.
+
 **int hk_kprobe_check(const char *sym, struct hk_kprobe_report *out)**
 
 ask the address gates of register_kprobe before an install and name the
@@ -415,6 +437,12 @@ HK_KPROBE_PATCHSITE    a recorded ftrace call site, refused on a kernel
                        without kprobes on ftrace, arm64 has none
 HK_KPROBE_OK           no address gate matched
 ```
+
+**int hk_kprobe_check_at(unsigned long addr, struct hk_kprobe_report *out)**
+
+the same gates on an address, for a target that never was a symbol. a
+report on an address never carries HK_KPROBE_UNRESOLVED or the cfi
+preamble state, both of those are about a name.
 
 the gates are the kprobe ones for a kretprobe too, register_kretprobe
 registers a kprobe. HK_KPROBE_OK is not a promise, an install can still
@@ -444,9 +472,25 @@ static int pre(struct kprobe *p, struct pt_regs *regs)
 }
 ```
 
-**void hk_kprobe_remove(struct hk_kprobe *h)** unregisters and untracks.
+the other idiom is hk_regs_redirect, which hands the call to another
+function instead of running the target. the replacement is entered with
+the argument registers of the target, on the caller stack of the target,
+and its return goes to the caller of the target, so what it returns is
+what the target returns. it is reached by the return from the breakpoint
+exception and not by a branch, so no cfi check and no bti landing pad
+stands at its entry, and the target does not run unless the replacement
+calls it. a handler that redirects returns 1 like one that parks the pc,
+and reaching the original again is the address of the probed entry, which
+is what hk_redir below is about.
+
+**int hk_kprobe_remove(struct hk_kprobe *h)** unregisters and untracks, 0
+when the probe is gone and -ENODATA when unregister_kprobe cannot be
+reached and the probe is still armed, a second remove being a no op.
 **void hk_kprobe_exit(void)** removes every tracked probe, called by
-hk_exit.
+hk_exit. **unsigned int hk_kprobe_pending(void)** counts the probes that
+sweep could not take back: their handler is still reached from kernel
+text, so a module that owns one must not be unmapped, and hk_exit_block
+counts them.
 
 **int hk_kprobe_clear_blacklist(void)**
 
@@ -460,6 +504,88 @@ probes on blacklisted symbols, it is not called by hk_kprobe_install.
 
 restore the saved start/end addresses and free the save array. called
 automatically by hk_kprobe_exit, safe to call manually before exit.
+
+## Redirect
+
+running another function in place of a kernel function. the caller names
+the target, the replacement and the mechanism, and the library keeps no
+opinion about which mechanism suits which target: hk_inline_probe and
+hk_kprobe_check answer that before anything is written. a refused install
+returns what its route reports, -EINVAL for a NULL argument and
+-EOPNOTSUPP for a route that cannot take what it was given.
+
+```c
+enum hk_redir_how {
+	HK_REDIR_TEXT = 0,	/* the entry is written, the target must not be running */
+	HK_REDIR_KPROBE,	/* the entry keeps its bytes, a breakpoint carries the call */
+};
+
+struct hk_redir {
+	enum hk_redir_how how;
+	const char *name;	/* the target as it was named, null for an address */
+	unsigned long addr;	/* the entry a call lands on */
+	unsigned long orig;	/* what a replacement calls to reach the original */
+	unsigned long repl;	/* what a redirected call runs instead */
+	bool live;
+	bool pending;
+	struct xarray guard;
+	union {
+		struct hk_inline text;
+		struct hk_kprobe kprobe;
+	} u;
+};
+```
+
+**int hk_redir_install(struct hk_redir *r, const char *sym, const char *repl_sym, enum hk_redir_how how)**
+
+both sides by name, resolved here, because a branch is written to the
+address the resolver answers, cfi suffix included, and because the text
+route judges and relocates the entry before it writes it. orig is the
+trampoline hk_inline builds for HK_REDIR_TEXT and the probed entry itself
+for HK_REDIR_KPROBE.
+
+**int hk_redir_install_at(struct hk_redir *r, unsigned long addr, unsigned long repl, enum hk_redir_how how)**
+
+both sides by address, nothing resolved, so a syscall table entry the
+caller read itself is a target like any other. HK_REDIR_KPROBE only,
+HK_REDIR_TEXT answers -EOPNOTSUPP because it patches an entry it has to
+judge by name. addr has to be the address a call lands on: on a cfi
+build the plain symbol of a function is a stub and a call inside the same
+module lands behind it, so what a table entry holds or what
+hk_redir_install resolved is a target and a plain &func is not.
+
+**int hk_redir_remove(struct hk_redir *r)** takes it back. the text route
+disables the entry, waits one tasks rcu grace period and frees its
+trampoline, and a hook whose entry could not be restored stays live and
+counted by hk_inline_pending. the kprobe route unregisters the probe,
+waits for a core still inside the replacement, then drops the guard, and
+a probe that could not be unregistered is reported here and counted by
+hk_kprobe_pending.
+
+**the guard of the kprobe route.** a replacement reaches the original by
+calling hk_redir.orig, which is the probed entry itself: the breakpoint
+fires again and the handler has to let that call through instead of
+redirecting it a second time. the guard is that marker, it is per task
+and per hook, the handler this library installs sets it before it parks
+the pc, and the replacement clears it through hk_redir_leave. a
+replacement that never clears it stops being redirected for that task and
+the original runs from then on, which is a lost hook and not a crash. the
+text route needs no guard, its trampoline is a copy of the entry.
+
+```c
+__nocfi long my_target(int a)
+{
+	long ret = my_orig(a);		/* my_orig is r->orig */
+
+	hk_redir_leave(&r);
+	return ret + 1;
+}
+```
+
+the replacement is entered by the return from the breakpoint exception
+with the registers of the target, so give it the prototype of the target
+and mark it __nocfi like every other function of a module that is reached
+from a path the compiler did not build.
 
 ## Kretprobe
 
