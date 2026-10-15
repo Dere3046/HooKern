@@ -38,9 +38,25 @@ int hk_kretprobe_install_ex(struct hk_kretprobe *h, const char *sym,
 			    kretprobe_handler_t entry,
 			    kretprobe_handler_t handler,
 			    size_t data_size);
-/* unregister and drop the tracking node, a second remove is a no op */
-void hk_kretprobe_remove(struct hk_kretprobe *h);
+/*
+ * the same for a target the caller holds as an address, which is what a function
+ * of its own needs: a completion signal has to sit on the replacement, and a
+ * replacement is a pointer, not a name
+ */
+int hk_kretprobe_install_at(struct hk_kretprobe *h, unsigned long addr,
+			    kretprobe_handler_t handler);
+/*
+ * unregister and drop the tracking node, a second remove is a no op. 0 when the
+ * probe is gone, -ENODATA when unregister_kretprobe cannot be reached and the
+ * probe is still armed
+ */
+int hk_kretprobe_remove(struct hk_kretprobe *h);
 /* unregister every tracked probe, called by hk_exit */
 void hk_kretprobe_exit(void);
+/*
+ * probes the exit sweep could not take back, the counterpart of
+ * hk_kprobe_pending and counted by the same gate
+ */
+unsigned int hk_kretprobe_pending(void);
 
 #endif

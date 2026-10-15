@@ -45,10 +45,14 @@ function whose address was taken, and that body is returned.
 
 the end of a module's exit path, for a module whose kernel text still
 branches into a hook. it never returns while a hook is live: it retries
-`hk_inline_exit` and `hk_ptr_exit` every 60 seconds and only returns
-once every count is zero. rmmod unmaps module text and data as soon as
-the exit path returns, so a live detour without this points into freed
-memory.
+`hk_inline_exit`, `hk_ptr_exit` and `hk_kretprobe_exit` every 60 seconds
+and only returns once every count is zero, which is `hk_inline_pending`,
+`hk_ptr_pending`, `hk_kprobe_pending`, `hk_kretprobe_pending`,
+`hk_redir_pending` and `hk_redir_inflight`. the last one is what covers a
+call that is inside a replacement right now: that code is this module's
+and the reference it holds is what keeps the kernel from unmapping it.
+rmmod unmaps module text and data as soon as the exit path returns, so a
+live detour without this points into freed memory.
 
 ## Symbols
 
@@ -522,13 +526,16 @@ enum hk_redir_how {
 
 struct hk_redir {
 	enum hk_redir_how how;
+	enum hk_redir_guard guard;	/* named before the install, zero is the task marker */
+	bool pin;			/* named before the install, see below */
 	const char *name;	/* the target as it was named, null for an address */
 	unsigned long addr;	/* the entry a call lands on */
 	unsigned long orig;	/* what a replacement calls to reach the original */
 	unsigned long repl;	/* what a redirected call runs instead */
 	bool live;
 	bool pending;
-	struct xarray guard;
+	struct hk_kretprobe retprobe;	/* the completion signal, pinned hooks only */
+	struct xarray tasks;		/* the per task marker, task guard only */
 	union {
 		struct hk_inline text;
 		struct hk_kprobe kprobe;
@@ -562,15 +569,45 @@ waits for a core still inside the replacement, then drops the guard, and
 a probe that could not be unregistered is reported here and counted by
 hk_kprobe_pending.
 
-**the guard of the kprobe route.** a replacement reaches the original by
-calling hk_redir.orig, which is the probed entry itself: the breakpoint
-fires again and the handler has to let that call through instead of
-redirecting it a second time. the guard is that marker, it is per task
-and per hook, the handler this library installs sets it before it parks
-the pc, and the replacement clears it through hk_redir_leave. a
-replacement that never clears it stops being redirected for that task and
-the original runs from then on, which is a lost hook and not a crash. the
-text route needs no guard, its trampoline is a copy of the entry.
+**the marker of the kprobe route.** a replacement reaches the original
+by calling hk_redir.orig, which is the probed entry itself: the
+breakpoint fires again and the handler has to let that call through
+instead of redirecting it a second time. which calls are let through is
+the caller's choice, named in hk_redir.guard before the install.
+
+HK_REDIR_GUARD_TASK is the per task marker, and the zero value. the
+handler sets it before it parks the pc and the replacement clears it
+through hk_redir_leave. a replacement that never clears it stops being
+redirected for that task and the original runs from then on, which is a
+lost hook and not a crash. it costs one xarray entry per task that passes
+and needs the leave call in every replacement.
+
+HK_REDIR_GUARD_CALLER keeps no state: the handler reads the return address
+and lets a call from the module this library was built into through. there
+is nothing to clear and nothing to forget, and a call the owning module
+makes on purpose is let through as well, which is the trade against the
+task marker.
+
+the text route needs no marker, its trampoline is a copy of the entry, and
+naming either pin or the caller marker for it is refused with
+-EOPNOTSUPP rather than ignored.
+
+**the pin, kprobe route only.** with hk_redir.pin set before the install,
+a redirected call holds a reference on the module this library was built
+into, taken in the handler and dropped by a kretprobe the library arms on
+the replacement itself. the kernel's own delete_module refuses to unload a
+module whose reference count is not zero, so the module cannot be freed
+under a call that is still running, and no gate of this library is what
+decides it. a pin that cannot be completed is refused instead of being
+dropped: -ENODATA when try_module_get or module_put cannot be resolved,
+the kernel code when the completion signal cannot be armed. it costs one
+more trap per redirected call, and the count belongs to the module rather
+than to one hook, because the module is what must not be freed.
+
+**unsigned int hk_redir_pending(void)** counts the redirects that could
+not be taken back, and **unsigned int hk_redir_inflight(void)** reports the
+calls that are inside a replacement right now, pinned hooks only. both are
+counted by hk_exit_block.
 
 ```c
 __nocfi long my_target(int a)
@@ -617,9 +654,18 @@ struct hk_kretprobe {
 };
 ```
 
-**void hk_kretprobe_remove(struct hk_kretprobe *h)** and **void
+**int hk_kretprobe_install_at(struct hk_kretprobe *h, unsigned long addr, kretprobe_handler_t handler)**
+
+the same for a target the caller holds as an address, which is what a
+function of its own needs: a completion signal has to sit on the
+replacement, and a replacement is a pointer, not a name. the gates, the
+tracking and the exit path are the ones hk_kretprobe_install uses.
+
+**int hk_kretprobe_remove(struct hk_kretprobe *h)** and **void
 hk_kretprobe_exit(void)** mirror the kprobe ones, including the log line
-when the probe cannot be unregistered again.
+when the probe cannot be unregistered again, and **unsigned int
+hk_kretprobe_pending(void)** counts the ones the sweep could not take
+back, the counterpart of hk_kprobe_pending.
 
 ## Binder trace
 

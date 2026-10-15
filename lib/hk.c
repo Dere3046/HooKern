@@ -12,6 +12,7 @@
 #include "hk_ptr.h"
 #include "hk_kprobe.h"
 #include "hk_kretprobe.h"
+#include "hk_redir.h"
 #include "hk_sighook.h"
 #include "hk_inline.h"
 #include "hk_patch.h"
@@ -141,13 +142,21 @@ void hk_exit_block(void)
 	unsigned int left;
 
 	for (;;) {
-		left = hk_inline_pending() + hk_ptr_pending() + hk_kprobe_pending();
+		/*
+		 * the calls inside a replacement are counted here too: their code is
+		 * this module's, and the reference they hold is what keeps the kernel
+		 * from unmapping it, so a clean exit waits for them as well
+		 */
+		left = hk_inline_pending() + hk_ptr_pending() +
+		       hk_kprobe_pending() + hk_kretprobe_pending() +
+		       hk_redir_pending() + hk_redir_inflight();
 		if (!left)
 			break;
 		pr_warn("[lkmhook] exit blocked, %u hook(s) still live\n", left);
 		ssleep(60);
 		hk_inline_exit();
 		hk_ptr_exit();
+		hk_kretprobe_exit();
 	}
 	pr_info("[lkmhook] exit clean\n");
 	g_exiting = false;
