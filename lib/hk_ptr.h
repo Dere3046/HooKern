@@ -27,10 +27,20 @@ int hk_ptr_hook(void **slot, void *replacement, void **orig_out);
 /* restore the recorded original, silent when the slot is not hooked */
 void hk_ptr_unhook(void **slot);
 
+/*
+ * what a consumer compiles in is its own build decision. setting the flag leaves
+ * this module out of the link, and the calls the core makes into it become
+ * nothing, while the entry points of the module itself stay declared: calling one
+ * of those without its object is a link error, never a silent no op
+ */
+#ifdef HK_NO_PTR
+static inline void hk_ptr_exit(void) { }
+static inline unsigned int hk_ptr_pending(void) { return 0; }
+#else
 /* restore every tracked slot, called by hk_exit */
 void hk_ptr_exit(void);
 
 /* slots whose original could not be written back, counted for the exit gate */
 unsigned int hk_ptr_pending(void);
-
+#endif
 #endif

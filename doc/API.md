@@ -19,6 +19,36 @@ struct hk_cfg {
 };
 ```
 
+## What a build compiles in
+
+the library is a core and a set of groups, and a consumer links the ones it uses.
+the core is `hk` and `hk_ksym`, which everything needs. every other group is one
+object, and a group the consumer leaves out is left out of the link entirely:
+
+| group | objects | flag | needs |
+|---|---|---|---|
+| patch | hk_patch hk_flush | HK_NO_PATCH | core |
+| kprobe | hk_kprobe | HK_NO_KPROBE | core |
+| kretprobe | hk_kretprobe | HK_NO_KRETPROBE | core |
+| inline | hk_inline | HK_NO_INLINE | patch |
+| ptr | hk_ptr | HK_NO_PTR | patch |
+| cfi | hk_cfi | none | patch |
+| lsm | hk_lsm | none | patch |
+| sighook | hk_sighook | HK_NO_SIGHOOK | kprobe |
+| binder | hk_binder | none | inline |
+| redir | hk_redir | HK_NO_REDIR | kprobe, kretprobe, and inline with patch for the text route |
+
+the flag is what keeps the core linkable without the group: it turns the calls the
+core makes into that group into nothing, so `hk_exit` and `hk_exit_block` still
+compile against a build that has no sighook in it. the flag never removes an entry
+point of the group itself, so calling `hk_inline_hook` in a build that left inline
+out is a link error and not a call that quietly does nothing. cfi, lsm and binder
+are not called by the core at all, which is why they need no flag.
+
+a build without inline has no text route: hk_redir_install answers -EOPNOTSUPP for
+HK_REDIR_TEXT, which is the same answer the address route gives to a mechanism the
+caller did not link in.
+
 ## Lifecycle
 
 **int hk_init(const struct hk_cfg *cfg)**

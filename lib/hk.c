@@ -111,6 +111,27 @@ int hk_init(const struct hk_cfg *cfg)
 	return 0;
 }
 
+typedef void (*hk_synchronize_rcu_tasks_fn)(void);
+
+/*
+ * __nocfi on the body, not decoration: the symbol is resolved at runtime and the
+ * call is indirect, and the cfi typeid the compiler would check it against is not
+ * the one the kernel recorded. 5.10 panics on it, the target named in the message
+ */
+__nocfi void hk_wait_tasks_rcu(void)
+{
+	hk_synchronize_rcu_tasks_fn fn;
+	unsigned long sym = hk_resolve("synchronize_rcu_tasks");
+
+	if (!sym || !hk_ker_addr_ok(sym)) {
+		pr_warn_once("[lkmhook] synchronize_rcu_tasks not found, "
+			     "a freed trampoline may still be running\n");
+		return;
+	}
+	fn = (hk_synchronize_rcu_tasks_fn)sym;
+	fn();
+}
+
 void hk_exit(void)
 {
 	/*

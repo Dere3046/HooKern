@@ -75,6 +75,10 @@
  *		return ret + 1;
  *	}
  *
+ * a build that leaves the inline group out has no text route at all: the install
+ * answers -EOPNOTSUPP for HK_REDIR_TEXT, the same answer the address route gives to
+ * a mechanism the caller did not link in
+ *
  * a refused install returns what its route reports, -EINVAL for a null argument,
  * -EOPNOTSUPP for a route that cannot take what it was given, and -ENODATA for a
  * pin whose kernel entry points cannot be resolved: the text route reports what
@@ -135,10 +139,21 @@ int hk_redir_install_at(struct hk_redir *r, unsigned long addr,
  */
 int hk_redir_remove(struct hk_redir *r);
 
+/*
+ * what a consumer compiles in is its own build decision. setting the flag leaves
+ * this module out of the link, and the calls the core makes into it become
+ * nothing, while the entry points of the module itself stay declared: calling one
+ * of those without its object is a link error, never a silent no op
+ */
+#ifdef HK_NO_REDIR
+static inline unsigned int hk_redir_pending(void) { return 0; }
+static inline unsigned int hk_redir_inflight(void) { return 0; }
+#else
 /* redirects the exit path refuses to unload over: what could not be taken back */
 unsigned int hk_redir_pending(void);
 /* calls inside a replacement right now, pinned hooks only */
 unsigned int hk_redir_inflight(void);
+#endif
 
 /*
  * the task marker of the kprobe route. the handler this library installs calls the
@@ -148,5 +163,4 @@ unsigned int hk_redir_inflight(void);
  */
 bool hk_redir_guard_enter(struct hk_redir *r);
 void hk_redir_leave(struct hk_redir *r);
-
 #endif

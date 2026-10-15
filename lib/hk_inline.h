@@ -71,19 +71,20 @@ void hk_inline_free(struct hk_inline *h);
  */
 void hk_inline_unhook(struct hk_inline *h);
 
-/* retry every pending unload, called by hk_exit and hk_exit_block */
+/*
+ * what a consumer compiles in is its own build decision. setting the flag leaves
+ * this module out of the link, and the calls the core makes into it become
+ * nothing, while the entry points of the module itself stay declared: calling one
+ * of those without its object is a link error, never a silent no op
+ */
+#ifdef HK_NO_INLINE
+static inline void hk_inline_exit(void) { }
+static inline unsigned int hk_inline_pending(void) { return 0; }
+#else
 void hk_inline_exit(void);
 unsigned int hk_inline_pending(void);
+#endif
 
-/*
- * one tasks rcu grace period: what has to pass between the moment code of this
- * module is taken out of a path another core could be running and the moment it is
- * freed. it is the flavour the kernel uses for its own text pokes, the symbol is
- * resolved here, and a kernel without it says so once instead of waiting for
- * nothing. the call inside is indirect and cfi is off for it, a direct call from a
- * consumer needs nothing
- */
-void hk_wait_tasks_rcu(void);
 
 /*
  * what the entry of a probe target looks like from the outside. everything
@@ -130,5 +131,4 @@ struct hk_inline_probe {
  * 0 when the report was filled, -EINVAL on a NULL argument.
  */
 int hk_inline_probe(const char *sym, struct hk_inline_probe *out);
-
 #endif

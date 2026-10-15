@@ -45,7 +45,16 @@ int hk_sighook_probe(char *out, size_t len);
 
 /* register the probes, 0 when the dispatch is armed */
 int hk_sighook_install(void);
+/*
+ * what a consumer compiles in is its own build decision. setting the flag leaves
+ * this module out of the link, and the calls the core makes into it become
+ * nothing, while the entry points of the module itself stay declared: calling one
+ * of those without its object is a link error, never a silent no op
+ */
+#ifdef HK_NO_SIGHOOK
+static inline void hk_sighook_exit(void) { }
+#else
 /* unregister the probes and drop the table, called by hk_exit */
 void hk_sighook_exit(void);
-
+#endif
 #endif

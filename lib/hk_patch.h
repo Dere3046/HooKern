@@ -152,8 +152,24 @@ int hk_patch_write(void *dst, unsigned long val);
  * called by hk_init, not by consumers: resolve what the primitives need, in
  * process context, and record the configured write path
  */
+/*
+ * what a consumer compiles in is its own build decision. setting the flag leaves
+ * this module out of the link, and the calls the core makes into it become
+ * nothing, while the entry points of the module itself stay declared: calling one
+ * of those without its object is a link error, never a silent no op
+ */
+#ifdef HK_NO_PATCH
+static inline void hk_patch_init(void) { }
+static inline void hk_patch_set_write(int (*write)(void *dst, const void *src,
+						   size_t len))
+{
+	(void)write;
+}
+#else
 void hk_patch_init(void);
 bool hk_patch_kernel_primitive_ok(unsigned long addr);
-void hk_patch_set_write(int (*write)(void *dst, const void *src, size_t len));
+void hk_patch_set_write(int (*write)(void *dst, const void *src,
+				    size_t len));
+#endif
 
 #endif

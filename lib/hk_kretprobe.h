@@ -51,12 +51,32 @@ int hk_kretprobe_install_at(struct hk_kretprobe *h, unsigned long addr,
  * probe is still armed
  */
 int hk_kretprobe_remove(struct hk_kretprobe *h);
+/*
+ * what a consumer compiles in is its own build decision. setting the flag leaves
+ * this module out of the link, and the calls the core makes into it become
+ * nothing, while the entry points of the module itself stay declared: calling one
+ * of those without its object is a link error, never a silent no op
+ */
+#ifdef HK_NO_KRETPROBE
+static inline void hk_kretprobe_exit(void) { }
+#else
 /* unregister every tracked probe, called by hk_exit */
 void hk_kretprobe_exit(void);
+#endif
 /*
  * probes the exit sweep could not take back, the counterpart of
  * hk_kprobe_pending and counted by the same gate
  */
+/*
+ * what a consumer compiles in is its own build decision. setting the flag leaves
+ * this module out of the link, and the calls the core makes into it become
+ * nothing, while the entry points of the module itself stay declared: calling one
+ * of those without its object is a link error, never a silent no op
+ */
+#ifdef HK_NO_KRETPROBE
+static inline unsigned int hk_kretprobe_pending(void) { return 0; }
+#else
 unsigned int hk_kretprobe_pending(void);
+#endif
 
 #endif

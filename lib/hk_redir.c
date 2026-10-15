@@ -242,6 +242,10 @@ int hk_redir_install(struct hk_redir *r, const char *sym, const char *repl_sym,
 		return -EINVAL;
 
 	if (how == HK_REDIR_TEXT) {
+#ifdef HK_NO_INLINE
+		/* the entry writer is not part of this build, so there is no text route */
+		return -EOPNOTSUPP;
+#else
 		/* neither of the two is a mechanism the entry writer has */
 		if (r->pin || r->guard != HK_REDIR_GUARD_TASK)
 			return -EOPNOTSUPP;
@@ -259,6 +263,7 @@ int hk_redir_install(struct hk_redir *r, const char *sym, const char *repl_sym,
 		r->orig = r->u.text.orig;
 		r->live = true;
 		return 0;
+#endif
 	}
 
 	addr = hk_resolve(sym);
@@ -287,8 +292,10 @@ int hk_redir_remove(struct hk_redir *r)
 	WRITE_ONCE(r->live, false);
 
 	if (r->how == HK_REDIR_TEXT) {
+#ifndef HK_NO_INLINE
 		/* the disable, the grace period and the free, in that order */
 		hk_inline_unhook(&r->u.text);
+#endif
 		return 0;
 	}
 

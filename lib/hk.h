@@ -38,4 +38,13 @@ void hk_exit_fail(int count);
 unsigned int hk_exit_failed(void);
 void hk_exit_block(void);
 
+/*
+ * one tasks rcu grace period: what has to pass between the moment code of this
+ * module is taken out of a path another core could be running and the moment it is
+ * freed. it is the flavour the kernel uses for its own text pokes, the symbol is
+ * resolved here, and a kernel without it says so once instead of waiting for
+ * nothing. the call inside is indirect and cfi is off for it, a direct call from a
+ * consumer needs nothing
+ */
+void hk_wait_tasks_rcu(void);
 #endif

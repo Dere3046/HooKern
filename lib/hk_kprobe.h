@@ -56,15 +56,36 @@ int hk_kprobe_install_at(struct hk_kprobe *h, unsigned long addr,
  * is still armed, which is what a caller that owns the code behind it has to know
  */
 int hk_kprobe_remove(struct hk_kprobe *h);
+/*
+ * what a consumer compiles in is its own build decision. setting the flag leaves
+ * this module out of the link, and the calls the core makes into it become
+ * nothing, while the entry points of the module itself stay declared: calling one
+ * of those without its object is a link error, never a silent no op
+ */
+#ifdef HK_NO_KPROBE
+static inline void hk_kprobe_exit(void) { }
+#else
 /* unregister every tracked probe, called by hk_exit */
 void hk_kprobe_exit(void);
+#endif
 /*
  * probes the exit sweep could not take back, which are the ones whose handler is
  * still reached from kernel text: a module that owns such a probe must not be
  * unmapped, and this is what hk_exit_block counts. a remove the caller runs itself
  * answers the same question in its return value and does not add to this
  */
+/*
+ * what a consumer compiles in is its own build decision. setting the flag leaves
+ * this module out of the link, and the calls the core makes into it become
+ * nothing, while the entry points of the module itself stay declared: calling one
+ * of those without its object is a link error, never a silent no op
+ */
+#ifdef HK_NO_KPROBE
+static inline unsigned int hk_kprobe_pending(void) { return 0; }
+#else
 unsigned int hk_kprobe_pending(void);
+#endif
+
 
 /* drop the blacklist entries, every probe refused with HK_KPROBE_BLACKLISTED
  * needs this first, hk_kprobe_exit restores them */
@@ -185,5 +206,4 @@ static inline void hk_regs_redirect(struct pt_regs *regs, unsigned long fn)
 {
 	regs->pc = fn;
 }
-
 #endif
