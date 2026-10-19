@@ -744,6 +744,29 @@ static unsigned long *hk_pte_of(unsigned long addr)
 }
 
 /*
+ * an entry shorter than the window: a ret, a br or an unconditional branch ends the
+ * function, so the instructions after it belong to whatever the linker put next.
+ * copying those into a trampoline and jumping back into the middle of them is what
+ * a short function cannot survive, so the window is judged before anything is
+ * written and the caller is told to take the breakpoint route instead
+ */
+static int hk_inline_short(const u32 *win, unsigned int words)
+{
+	unsigned int i;
+
+	for (i = 0; i < words; i++) {
+		bool ret = (win[i] & 0xFFFFFC1F) == 0xD65F0000;
+		bool br = (win[i] & 0xFFFFFC1F) == 0xD61F0000;
+		bool b = (win[i] & 0xFC000000) == 0x14000000;
+
+		if ((ret || br || b) && i + 1 < words)
+			return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
+
+/*
  * the continuation of every relocated branch is an indirect branch, and an
  * indirect branch into a page whose pte carries the guarded attribute traps
  * unless the first instruction is a bti landing pad. the resumption points are
@@ -863,6 +886,12 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 		h->saved[i * 4 + 1] = (saved[i] >> 8) & 0xFF;
 		h->saved[i * 4 + 2] = (saved[i] >> 16) & 0xFF;
 		h->saved[i * 4 + 3] = (saved[i] >> 24) & 0xFF;
+	}
+	ret = hk_inline_short(saved, HK_INLINE_ENTRY_MAX);
+	if (ret) {
+		pr_warn("[lkmhook] inline %s is shorter than the window, breakpoint route\n",
+			sym);
+		goto err_free;
 	}
 
 	mem = (unsigned long)hk_exec_alloc(HK_TRAMP_SIZE);
