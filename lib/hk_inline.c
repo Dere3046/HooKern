@@ -9,6 +9,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/kernel.h>
 #include <linux/printk.h>
 #include <linux/rcupdate_trace.h>
 #include <linux/slab.h>
@@ -125,6 +126,16 @@ static const int hk_relo_len[] = {
 	8, 8, 8, 8,
 	2,
 };
+
+/*
+ * the three tables are indexed by the same instruction class, and the compiler
+ * can hold that: a class added to the enum without a mask, a type pattern and a
+ * length is a build error and not a wrong trampoline at runtime
+ */
+static_assert(ARRAY_SIZE(hk_masks) == ARRAY_SIZE(hk_types),
+	      "the class masks and the class patterns disagree");
+static_assert(ARRAY_SIZE(hk_relo_len) == ARRAY_SIZE(hk_masks),
+	      "the relocation lengths and the instruction classes disagree");
 
 static __nocfi u32 hk_get_insn(const u8 *p)
 {
@@ -485,6 +496,52 @@ static __nocfi int hk_relo_inst(struct hk_relo_ctx *c, u32 insn)
 		break;
 	}
 	return ret;
+}
+
+/* one class, one swing at the emitters: the api note is in the header */
+int hk_relo_check(void)
+{
+	u32 dst[HK_INLINE_ENTRY_MAX * 8];
+	u32 window[HK_INLINE_ENTRY_MAX];
+	unsigned long base = (unsigned long)&hk_relo_check;
+	struct hk_relo_ctx c;
+	char detail[64];
+	u32 i;
+	u32 j;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(hk_relo_len); i++) {
+		if (hk_insn_index(hk_types[i]) != (int)i) {
+			scnprintf(detail, sizeof(detail),
+				  "class %u matches class %d first", i,
+				  hk_insn_index(hk_types[i]));
+			hk_notice(HK_NOTICE_RELO_TABLE, detail);
+			return -EIO;
+		}
+		memset(&c, 0, sizeof(c));
+		memset(window, 0, sizeof(window));
+		window[0] = hk_types[i];
+		for (j = 1; j < HK_INLINE_ENTRY_MAX; j++)
+			window[j] = HK_INS_NOP;
+		c.dst = dst;
+		c.src = (const u8 *)window;
+		c.inst_addr = base;
+		c.tramp_start = base + 0x1000;
+		c.tramp_end = base + 0x1000 + HK_INLINE_PATCH_LEN;
+		c.backup_start = base + 0x2000;
+		memset(dst, 0, sizeof(dst));
+		ret = hk_relo_inst(&c, window[0]);
+		if (ret)
+			return ret;
+		if (c.count != (u32)hk_relo_len[i]) {
+			scnprintf(detail, sizeof(detail),
+				  "class %u emitted %u words, the table says %d",
+				  i, c.count, hk_relo_len[i]);
+			hk_notice(HK_NOTICE_RELO_TABLE, detail);
+			return -EIO;
+		}
+	}
+	return 0;
 }
 
 typedef void *(*hk_vmalloc_node_range_fn)(unsigned long size,
@@ -963,7 +1020,13 @@ void hk_inline_free(struct hk_inline *h)
 	}
 	if (h->addr && !h->disabled) {
 		mutex_unlock(&g_inline_lock);
-		pr_warn("[lkmhook] inline free before disable\n");
+		/*
+		 * freeing before the disable is a programmer error: the detour is
+		 * still the entry, so the free is refused and the trampoline stays.
+		 * the notice is what a caller that wants to know about it reads
+		 */
+		hk_notice(HK_NOTICE_FREE_BEFORE_DISABLE,
+			  h->name ? h->name : "unnamed hook");
 		return;
 	}
 	hk_bti_guard_restore(h);

@@ -118,7 +118,44 @@ typedef void (*hk_synchronize_rcu_tasks_fn)(void);
  * call is indirect, and the cfi typeid the compiler would check it against is not
  * the one the kernel recorded. 5.10 panics on it, the target named in the message
  */
-__nocfi void hk_wait_tasks_rcu(void)
+__nocfi /*
+ * the default notice is a warning, the level this library uses for a condition it
+ * refused and carried on from: the mistake belongs to the caller of the hook, not
+ * to the kernel, and a caller that wants it louder escalates in its own sink
+ */
+static void hk_notice_print(enum hk_notice what, const char *detail)
+{
+	static const char *const names[] = {
+		"free before disable",
+		"relo table",
+	};
+
+	pr_warn("[lkmhook] %s: %s\n",
+	       what < ARRAY_SIZE(names) ? names[what] : "notice",
+	       detail ? detail : "");
+}
+
+static hk_notify_fn g_notify = hk_notice_print;
+
+void hk_notice_set(hk_notify_fn fn)
+{
+	WRITE_ONCE(g_notify, fn);
+}
+
+void hk_notice(enum hk_notice what, const char *detail)
+{
+	hk_notify_fn fn = READ_ONCE(g_notify);
+
+	if (fn)
+		fn(what, detail);
+}
+
+/*
+ * the call inside is indirect and cfi is off for it, and noinline is the other
+ * half of that: an inline would move the call into whatever caller lto picked, and
+ * the check __nocfi turned off would come back with it
+ */
+__nocfi noinline void hk_wait_tasks_rcu(void)
 {
 	hk_synchronize_rcu_tasks_fn fn;
 	unsigned long sym = hk_resolve("synchronize_rcu_tasks");

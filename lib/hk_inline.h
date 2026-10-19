@@ -63,6 +63,15 @@ int hk_inline_hook(struct hk_inline *h, const char *sym,
  * window is released with the restore, a later install may take it */
 int hk_inline_disable(struct hk_inline *h);
 void hk_inline_free(struct hk_inline *h);
+
+/*
+ * reconcile the relocator's length table with the emitters that write the
+ * trampoline. the library never runs it by itself: an emitter and the table are
+ * written next to each other, and a build that wants them proven calls this. it
+ * allocates nothing and does not sleep, 0 when every class agrees, -EIO when one
+ * does not, and the notice names the class
+ */
+int hk_relo_check(void);
 /*
  * the three stage unload: disable the entry, wait one RCU tasks grace period so
  * a core that already fetched the detour is out of the trampoline, then free it.

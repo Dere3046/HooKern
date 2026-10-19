@@ -39,6 +39,25 @@ unsigned int hk_exit_failed(void);
 void hk_exit_block(void);
 
 /*
+ * the library refuses something and carries on, and says so here. a refused free
+ * of a live hook and an emitter that disagrees with the length table both leave the
+ * hook or the install in a state the caller wanted, so a caller that wants to count
+ * them, log them its own way or trip an assertion of its own installs a notice
+ * function. the default notice prints, which is the report a plain build has, and
+ * hk_notice_set(NULL) silences it for a build that trusts itself
+ */
+enum hk_notice {
+	HK_NOTICE_FREE_BEFORE_DISABLE = 0,	/* a free on a hook that is still live */
+	HK_NOTICE_RELO_TABLE,			/* an emitter and the length table disagree */
+};
+
+typedef void (*hk_notify_fn)(enum hk_notice what, const char *detail);
+
+/* called where the refusal happens: process context, and it must not sleep */
+void hk_notice_set(hk_notify_fn fn);
+void hk_notice(enum hk_notice what, const char *detail);
+
+/*
  * one tasks rcu grace period: what has to pass between the moment code of this
  * module is taken out of a path another core could be running and the moment it is
  * freed. it is the flavour the kernel uses for its own text pokes, the symbol is

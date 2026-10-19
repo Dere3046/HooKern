@@ -49,6 +49,39 @@ a build without inline has no text route: hk_redir_install answers -EOPNOTSUPP f
 HK_REDIR_TEXT, which is the same answer the address route gives to a mechanism the
 caller did not link in.
 
+**the notice, and what the library does not check by itself.** a refusal the
+library carries on from is reported through one function pointer, and the build
+installs none to get the default:
+
+	enum hk_notice {
+		HK_NOTICE_FREE_BEFORE_DISABLE = 0,
+		HK_NOTICE_RELO_TABLE,
+	};
+	typedef void (*hk_notify_fn)(enum hk_notice what, const char *detail);
+	void hk_notice_set(hk_notify_fn fn);
+
+the default prints with pr_warn, the level this library uses for a condition
+it refused and carried on from, which is the report a plain build gives.
+`hk_notice_set(NULL)` silences every notice, and a caller that wants to count them
+or trip its own assertion installs its own function. the notice runs where the
+refusal happens, in process context, and it must not sleep.
+
+**int hk_relo_check(void)** reconciles the relocator. every instruction class is
+emitted once into a scratch trampoline and the words it wrote are compared with
+the length table, which is what turns an address inside the window into the
+address the same instruction has in the trampoline: an emitter that grew without
+the table following would put every relocation after it one instruction off. the
+library never runs this by itself, because the table is written next to the
+emitters, so a build that wants it proven calls it: a test does, and a consumer
+that changed the relocator can. it allocates nothing, takes no lock and does not
+sleep. 0 when every class agrees, -EIO when one does not, and the notice names it.
+
+the class tables themselves are held by the compiler either way: the masks, the
+patterns and the lengths are three tables indexed by one enum, and a class added
+without its three entries is a build error. that check costs nothing and is
+always on; the emitters are the part the compiler cannot see, and that part is
+what hk_relo_check is for.
+
 ## Lifecycle
 
 **int hk_init(const struct hk_cfg *cfg)**
@@ -326,7 +359,14 @@ the trampoline stays allocated, call it again.
 **void hk_inline_free(struct hk_inline *h)**
 
 free the trampoline after disable and release the window. safe to call
-on a zeroed hook.
+on a zeroed hook. calling it before the disable is a programmer error
+and not a runtime condition: the detour is still the entry, so the free
+is refused and the trampoline stays, which leaks one allocation instead
+of leaving the entry pointing at freed code. the refusal is quiet in a
+plain build and reported as a warning, inside the notice
+`HK_NOTICE_FREE_BEFORE_DISABLE`: a caller that wants to hear about it keeps the
+default, and one that does not silences it with hk_notice_set(NULL) or installs
+its own function.
 
 **void hk_inline_unhook(struct hk_inline *h)**
 
