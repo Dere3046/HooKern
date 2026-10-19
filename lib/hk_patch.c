@@ -406,6 +406,22 @@ unsigned long hk_va_walk_pa(unsigned long va)
  * comes from the descriptor of the level that maps the address, so a block mapping
  * answers as truthfully as a page one
  */
+int hk_route_probe(unsigned long addr, struct hk_route *out)
+{
+	unsigned long pa;
+
+	if (!out || !addr)
+		return -EINVAL;
+	memset(out, 0, sizeof(*out));
+	out->kind = hk_va_kind(addr);
+	out->level = hk_va_level(addr);
+	out->block_map = out->level > 0;
+	out->writable = hk_va_writable(addr);
+	pa = hk_va_walk_pa(addr);
+	out->maps = pa && hk_va_maps(addr, pa);
+	return 0;
+}
+
 bool hk_va_writable(unsigned long va)
 {
 	unsigned long pa = 0;

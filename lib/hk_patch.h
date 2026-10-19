@@ -100,6 +100,30 @@ enum hk_va_kind {
 int hk_va_kind(unsigned long va);
 int hk_va_level(unsigned long va);
 bool hk_va_writable(unsigned long va);
+/*
+ * one address, every fact a caller needs to choose a route itself. this is the
+ * queries above together, for a layer that wants to decide once instead of asking
+ * four times: the library never picks a route from it. the protection a vendor
+ * kernel puts on a page shows up as writable being false while the address still
+ * translates, and a block mapping as level above zero, which is the shape a page
+ * table write cannot take
+ */
+struct hk_route {
+	int kind;		/* enum hk_va_kind of the address */
+	int level;		/* walk level, above zero means a block mapping */
+	bool block_map;		/* no pte to change, text writes still work */
+	bool writable;		/* writable through the current page table */
+	bool maps;		/* the entry carries the frame the address translates to */
+};
+
+/*
+ * fill one of these in. nothing is written, nothing is installed: it reads the page
+ * table and answers what it found. a protection this library has no name for shows
+ * up as a false in the record, which is the honest answer to a caller that wanted
+ * to know whether its own route stands a chance. the breakpoint gates are a
+ * question of their own, hk_kprobe_check_at, so a caller that wants both asks both
+ */
+int hk_route_probe(unsigned long addr, struct hk_route *out);
 bool hk_va_maps(unsigned long va, unsigned long pa);
 bool hk_va_maps_by(unsigned long va, unsigned long pa,
 		   unsigned long (*to_pa)(unsigned long va));
