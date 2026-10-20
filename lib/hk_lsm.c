@@ -8,6 +8,7 @@
 #include <linux/lsm_hooks.h>
 #include <linux/mutex.h>
 #include <linux/printk.h>
+#include <linux/uaccess.h>
 #include <linux/rcupdate.h>
 #include <linux/string.h>
 #include <linux/version.h>
@@ -133,6 +134,47 @@ static int hk_lsm_update_scall(struct lsm_static_call *scall,
 	return 0;
 }
 #endif
+
+/*
+ * the offset of a member inside the head object is not something a kernel without a
+ * type source can answer, and a kernel that answers nothing here still publishes the
+ * object itself. the head is then found by walking the candidates and asking which
+ * one carries the target: the hook list keeps its shape across the kernels this
+ * library supports, and every read goes through the nofault copy so a wrong guess
+ * costs a return value and not a fault
+ */
+#define HK_LSM_SCAN_HEADS 32
+#define HK_LSM_SCAN_DEPTH 64
+
+static struct hlist_head *hk_lsm_scan_head(unsigned long heads, void *target,
+					   size_t hook_off)
+{
+	size_t i;
+
+	for (i = 0; i < HK_LSM_SCAN_HEADS; i++) {
+		unsigned long head = heads + i * sizeof(struct hlist_head);
+		unsigned long node;
+		unsigned int j;
+
+		if (copy_from_kernel_nofault(&node, (void *)head, sizeof(node)))
+			return NULL;
+		for (j = 0; j < HK_LSM_SCAN_DEPTH && node; j++) {
+			struct hlist_node *list = (struct hlist_node *)node;
+			struct hlist_node next;
+			void *hook;
+
+			if (copy_from_kernel_nofault(&next, list, sizeof(next)))
+				break;
+			if (copy_from_kernel_nofault(&hook, (char *)node + hook_off,
+						     sizeof(hook)))
+				break;
+			if (hook == target)
+				return (struct hlist_head *)head;
+			node = (unsigned long)next.next;
+		}
+	}
+	return NULL;
+}
 
 int hk_lsm_hook(struct hk_lsm_hook *hook)
 {
@@ -320,10 +362,23 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 		goto out_unlock;
 	}
 	head_off = hook->head_offset;
-	hk_lsm_off("security_hook_heads", hook->head_name, &head_off);
-	head = (struct hlist_head *)(heads_addr + head_off);
-	head_end = (struct hlist_head *)(heads_addr +
-					 sizeof(struct security_hook_heads));
+	if (hk_lsm_off("security_hook_heads", hook->head_name, &head_off)) {
+		/*
+		 * no type source answered, so the head is the one that carries the
+		 * target. the layout stays the first choice because it names the
+		 * member, and this is the state a kernel without one runs in
+		 */
+		head = hk_lsm_scan_head(heads_addr, target, hook_off);
+		if (!head) {
+			ret = -ENODATA;
+			goto out_unlock;
+		}
+		head_end = head + 1;
+	} else {
+		head = (struct hlist_head *)(heads_addr + head_off);
+		head_end = (struct hlist_head *)(heads_addr +
+						 sizeof(struct security_hook_heads));
+	}
 
 	for (; head < head_end; head++) {
 		hlist_for_each_entry(entry, head, list) {
