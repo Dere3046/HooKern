@@ -407,9 +407,15 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 	}
 
 	for (; head < head_end; head++) {
-		hlist_for_each_entry(entry, head, list) {
-			void **slot = (void **)((char *)entry +
-						 hook_off);
+		struct hlist_node *node;
+
+		/*
+		 * the walk is over the node type rather than the kernel's entry type:
+		 * the entry's first word is the list node on every kernel this library
+		 * supports, and its second is the hook
+		 */
+		hlist_for_each(node, head) {
+			void **slot = (void **)((char *)node + hook_off);
 			void *current_origin = READ_ONCE(*slot);
 			int j;
 
@@ -440,9 +446,11 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 					ret = -EINVAL;
 					goto out_unlock;
 				}
-				hlist_for_each_entry(entry, head, list) {
+				struct hlist_node *node;
+
+				hlist_for_each(node, head) {
 					void **slot =
-						(void **)((char *)entry +
+						(void **)((char *)node +
 							  hook_off);
 					void *current_origin =
 						READ_ONCE(*slot);
@@ -454,24 +462,20 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 					}
 				}
 				if (head->first) {
-					selected_entry = hlist_entry(
-						head->first,
-						struct security_hook_list,
-						list);
+					/* the node is the first word of the entry */
+					selected_entry =
+						(struct security_hook_list *)head->first;
 					selected_slot =
 						(void **)((char *)selected_entry +
 							  hook_off);
 					selected_origin = *selected_slot;
 				} else {
-					selected_entry = &hook->list;
-					hook->list.head = head;
-					hook->list.list.next = NULL;
-					hook->list.list.pprev = &head->first;
-					hook->list.lsm = "lkmhook";
-					*(void **)((char *)selected_entry +
-						   hook_off) =
-						hook->replacement;
-					selected_slot = (void **)&head->first;
+					selected_entry =
+						(struct security_hook_list *)&hook->ours;
+					hook->ours.node.next = NULL;
+					hook->ours.node.pprev = &head->first;
+					hook->ours.hook = hook->replacement;
+					selected_slot = &hook->ours.hook;
 					selected_origin = NULL;
 				}
 			}
@@ -491,7 +495,7 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 	if (selected_origin)
 		ret = hk_lsm_patch_slot(selected_slot, hook->replacement);
 	else
-		ret = hk_lsm_patch_slot(selected_slot, &hook->list);
+		ret = hk_lsm_patch_slot(selected_slot, &hook->ours);
 	if (ret) {
 		ret = -EFAULT;
 		goto out_untrack;
@@ -536,8 +540,8 @@ void hk_lsm_unhook(struct hk_lsm_hook *hook)
 	/* a hook that went in through a static call says so with this field */
 	if (hook->scall)
 		slot = (void **)((char *)hook->entry + hook_off);
-	else if (hook->entry == &hook->list)
-		slot = (void **)&hook->list.head->first;
+	else if (hook->entry == (struct security_hook_list *)&hook->ours)
+		slot = (void **)&hook->ours.node.pprev;
 	else
 		slot = (void **)((char *)hook->entry + hook_off);
 

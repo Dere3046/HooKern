@@ -30,7 +30,15 @@ struct hk_lsm_hook {
 	struct security_hook_list *entry;
 	/* set when the hook went in through a static call, NULL for the list route */
 	void *scall;
-	struct security_hook_list list;
+	/*
+	 * the node this library inserts when the list route is taken. it is this
+	 * library's own type because the kernel's changed shape in 6.12, and what the
+	 * list carries at its second word is the hook either way
+	 */
+	struct hk_lsm_node {
+		struct hlist_node node;
+		void *hook;
+	} ours;
 	int offset;
 };
 
