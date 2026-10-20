@@ -10,11 +10,7 @@
 #include <linux/types.h>
 #include <linux/version.h>
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-#define HK_LSM_HEADS_TYPE struct lsm_static_calls_table
-#else
-#define HK_LSM_HEADS_TYPE struct security_hook_heads
-#endif
+
 
 struct hk_lsm_layout {
 	unsigned long (*resolve)(const char *name);
@@ -32,22 +28,23 @@ struct hk_lsm_hook {
 	void *replacement;
 	void *original;
 	struct security_hook_list *entry;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-	struct lsm_static_call *scall;
-#else
+	/* set when the hook went in through a static call, NULL for the list route */
+	void *scall;
 	struct security_hook_list list;
-#endif
 	int offset;
 };
 
+/*
+ * the head a hook belongs to is found at install time: by name when the consumer
+ * offers a layout, and by the target it carries when it does not. nothing here
+ * needs the shape of the object, so the catalogue entry only names the member
+ */
 #define HK_LSM_HOOK_INIT(member, target_symbol, replacement_fn, off)          \
 	{                                                                      \
 		.head_name = #member,                                          \
 		.target_name = target_symbol,                                  \
-		.head_offset = offsetof(HK_LSM_HEADS_TYPE, member),            \
-		.hook_offset = offsetof(struct security_hook_list, hook.member),\
 		.replacement = (void *)(replacement_fn),                       \
-		.offset = off,                                                 \
+		.offset = (off),                                               \
 	}
 
 int hk_lsm_init(const struct hk_lsm_layout *layout);

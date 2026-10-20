@@ -13,9 +13,7 @@
 #include <linux/string.h>
 #include <linux/version.h>
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 #include <linux/static_call.h>
-#endif
 
 #include "hk.h"
 #include "hk_lsm.h"
@@ -55,6 +53,18 @@ static unsigned long hk_lsm_resolve(const char *name)
 		return addr;
 
 	return hk_lsm_resolve_one(name);
+}
+
+static int hk_lsm_size(const char *type, size_t *size)
+{
+	u32 id;
+
+	if (!g_layout || !g_layout->type_by_name || !g_layout->type_size)
+		return -EOPNOTSUPP;
+	if (g_layout->type_by_name(type, &id))
+		return -ENOENT;
+	*size = g_layout->type_size(id);
+	return *size ? 0 : -ENOENT;
 }
 
 static int hk_lsm_off(const char *type, const char *member, size_t *off)
@@ -120,8 +130,7 @@ static int hk_lsm_patch_slot(void **slot, void *value)
 	return ret;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-static int hk_lsm_update_scall(struct lsm_static_call *scall,
+static int hk_lsm_update_scall(void *scall,
 			       size_t key_off, size_t tramp_off, void *value)
 {
 	void *key;
@@ -133,7 +142,6 @@ static int hk_lsm_update_scall(struct lsm_static_call *scall,
 	smp_wmb();
 	return 0;
 }
-#endif
 
 /*
  * the offset of a member inside the head object is not something a kernel without a
@@ -183,21 +191,6 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 	void *target;
 	const char *target_name;
 	size_t hook_off;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-	static unsigned long scalls_addr;
-	static size_t scalls_count;
-	static u32 lsm_max_cnt = 5;
-	size_t scall_key_off = offsetof(struct lsm_static_call, key);
-	size_t scall_tramp_off = offsetof(struct lsm_static_call, trampoline);
-	size_t scall_hl_off = offsetof(struct lsm_static_call, hl);
-	size_t scall_active_off = offsetof(struct lsm_static_call, active);
-	struct lsm_static_call *scalls;
-	struct security_hook_list *selected_entry = NULL;
-	struct lsm_static_call *selected_scall = NULL;
-	void **selected_slot = NULL;
-	void *selected_origin = NULL;
-	size_t i;
-#else
 	unsigned long heads_addr;
 	size_t head_off;
 	struct hlist_head *head;
@@ -205,7 +198,16 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 	struct security_hook_list *selected_entry = NULL;
 	void **selected_slot = NULL;
 	void *selected_origin = NULL;
-#endif
+	void *selected_scall = NULL;
+	void *scalls = NULL;
+	size_t scall_size = 0;
+	size_t scall_key_off = 0;
+	size_t scall_tramp_off = 0;
+	size_t scall_hl_off = 0;
+	size_t scall_active_off = 0;
+	size_t scalls_count = 0;
+	size_t lsm_max_cnt = 5;
+	size_t i;
 
 	if (!hook || !hook->replacement)
 		return -EINVAL;
@@ -233,38 +235,55 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 	hook_off = hook->hook_offset;
 	hk_lsm_off("security_hook_list", "hook", &hook_off);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-	hk_lsm_off("lsm_static_call", "key", &scall_key_off);
-	hk_lsm_off("lsm_static_call", "trampoline", &scall_tramp_off);
-	hk_lsm_off("lsm_static_call", "hl", &scall_hl_off);
-	hk_lsm_off("lsm_static_call", "active", &scall_active_off);
-
-	if (!scalls_addr)
-		scalls_addr = hk_lsm_resolve("static_calls_table");
-	if (!scalls_addr) {
-		ret = -ENOSYS;
-		goto out_unlock;
-	}
-
-	if (!scalls_count) {
+	/*
+	 * which route this kernel has is a runtime question: a kernel that publishes
+	 * the head object still has the lists, and one that does not has moved to
+	 * static calls. nothing here asks the version
+	 */
+	heads_addr = hk_lsm_resolve("security_hook_heads");
+	if (!heads_addr) {
+		unsigned long scalls_addr;
 		unsigned long active_addr;
+		size_t scalls_size = 0;
 		u32 active_cnt = 5;
 
-		active_addr = hk_lsm_resolve("lsm_active_cnt");
-		if (active_addr)
-			active_cnt = *(u32 *)active_addr;
-		if (!active_cnt || active_cnt > 20) {
-			ret = -EINVAL;
+		hk_lsm_off("lsm_static_call", "key", &scall_key_off);
+		hk_lsm_off("lsm_static_call", "trampoline", &scall_tramp_off);
+		hk_lsm_off("lsm_static_call", "hl", &scall_hl_off);
+		hk_lsm_off("lsm_static_call", "active", &scall_active_off);
+		hk_lsm_size("lsm_static_call", &scall_size);
+		hk_lsm_size("lsm_static_calls_table", &scalls_size);
+		/*
+		 * the static call route needs the shape of two structures. a kernel
+		 * without a type source cannot give it, so the route is not offered
+		 * there instead of guessed at
+		 */
+		if (!scall_size || !scalls_size || !scall_hl_off ||
+		    !scall_key_off || !scall_tramp_off || !scall_active_off) {
+			ret = -EOPNOTSUPP;
 			goto out_unlock;
 		}
+		scalls_addr = hk_lsm_resolve("static_calls_table");
+		if (!scalls_addr) {
+			ret = -ENOSYS;
+			goto out_unlock;
+		}
+		active_addr = hk_lsm_resolve("lsm_active_cnt");
+		if (active_addr) {
+			active_cnt = *(u32 *)active_addr;
+			if (!active_cnt || active_cnt > 20) {
+				ret = -EINVAL;
+				goto out_unlock;
+			}
+		}
+		scalls = (void *)scalls_addr;
+		scalls_count = scalls_size / scall_size;
 		lsm_max_cnt = active_cnt;
-		scalls_count = sizeof(struct lsm_static_calls_table) /
-			       sizeof(struct lsm_static_call);
 	}
 
-	scalls = (struct lsm_static_call *)scalls_addr;
+	if (!heads_addr) {
 	for (i = 0; i < scalls_count; i++) {
-		struct lsm_static_call *scall = &scalls[i];
+		void *scall = (char *)scalls + i * scall_size;
 		void **slot;
 		void *current_origin;
 		int j;
@@ -355,7 +374,6 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 	hook->scall = selected_scall;
 	hook->original = selected_origin;
 	pr_info("[lkmhook] lsm patched %s\n", hook->head_name);
-#else
 	heads_addr = hk_lsm_resolve("security_hook_heads");
 	if (!heads_addr) {
 		ret = -ENOENT;
@@ -375,9 +393,17 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 		}
 		head_end = head + 1;
 	} else {
+		size_t heads_size = 0;
+
 		head = (struct hlist_head *)(heads_addr + head_off);
-		head_end = (struct hlist_head *)(heads_addr +
-						 sizeof(struct security_hook_heads));
+		/*
+		 * the walk is bounded by the object's size when the layout knows it,
+		 * and by a fixed ceiling when it does not: the last head is reached by
+		 * walking rather than by knowing where the object ends
+		 */
+		if (hk_lsm_size("security_hook_heads", &heads_size) || !heads_size)
+			heads_size = HK_LSM_SCAN_HEADS * sizeof(struct hlist_head);
+		head_end = (struct hlist_head *)(heads_addr + heads_size);
 	}
 
 	for (; head < head_end; head++) {
@@ -472,9 +498,12 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 	}
 
 	hook->entry = selected_entry;
+	hook->scall = selected_scall;
 	hook->original = selected_origin;
 	pr_info("[lkmhook] lsm patched %s\n", hook->head_name);
-#endif
+	goto out_unlock;
+	}
+
 	goto out_unlock;
 
 out_untrack:
@@ -489,35 +518,28 @@ void hk_lsm_unhook(struct hk_lsm_hook *hook)
 {
 	size_t hook_off;
 	void **slot;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-	size_t scall_key_off = offsetof(struct lsm_static_call, key);
-	size_t scall_tramp_off = offsetof(struct lsm_static_call, trampoline);
-#endif
+	size_t scall_key_off = 0;
+	size_t scall_tramp_off = 0;
 
 	mutex_lock(&hk_lsm_lock);
 
 	hook_off = hook->hook_offset;
 	hk_lsm_off("security_hook_list", "hook", &hook_off);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	hk_lsm_off("lsm_static_call", "key", &scall_key_off);
 	hk_lsm_off("lsm_static_call", "trampoline", &scall_tramp_off);
 
-	if (!hook->entry || !hook->scall) {
-		mutex_unlock(&hk_lsm_lock);
-		return;
-	}
-	slot = (void **)((char *)hook->entry + hook_off);
-#else
 	if (!hook->entry) {
 		mutex_unlock(&hk_lsm_lock);
 		return;
 	}
-	if (hook->entry == &hook->list)
+	/* a hook that went in through a static call says so with this field */
+	if (hook->scall)
+		slot = (void **)((char *)hook->entry + hook_off);
+	else if (hook->entry == &hook->list)
 		slot = (void **)&hook->list.head->first;
 	else
 		slot = (void **)((char *)hook->entry + hook_off);
-#endif
 
 	if (hk_lsm_patch_slot(slot, hook->original)) {
 		pr_warn("[lkmhook] lsm restore failed %s\n",
@@ -526,21 +548,18 @@ void hk_lsm_unhook(struct hk_lsm_hook *hook)
 		return;
 	}
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-	if (hk_lsm_update_scall(hook->scall, scall_key_off, scall_tramp_off,
+	if (hook->scall &&
+	    hk_lsm_update_scall(hook->scall, scall_key_off, scall_tramp_off,
 				hook->original)) {
 		hk_lsm_patch_slot(slot, hook->replacement);
 		mutex_unlock(&hk_lsm_lock);
 		return;
 	}
-#endif
 
 	synchronize_rcu();
 	hk_lsm_untrack(hook);
 	hook->entry = NULL;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	hook->scall = NULL;
-#endif
 	mutex_unlock(&hk_lsm_lock);
 	pr_info("[lkmhook] lsm restored %s\n", hook->head_name ?: "unknown");
 }
