@@ -319,18 +319,8 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 		ret = -ENOENT;
 		goto out_unlock;
 	}
-	/*
-	 * the offset inside the head object comes from the layout the consumer
-	 * supplied, and a consumer that has no layout to give leaves it unknown. an
-	 * unknown offset is refused here rather than read through: guessing it would
-	 * walk memory that may hold something else
-	 */
 	head_off = hook->head_offset;
-	if (hk_lsm_off("security_hook_heads", hook->head_name, &head_off) &&
-	    !head_off) {
-		ret = -ENODATA;
-		goto out_unlock;
-	}
+	hk_lsm_off("security_hook_heads", hook->head_name, &head_off);
 	head = (struct hlist_head *)(heads_addr + head_off);
 	head_end = (struct hlist_head *)(heads_addr +
 					 sizeof(struct security_hook_heads));
