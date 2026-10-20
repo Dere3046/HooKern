@@ -20,59 +20,67 @@
 static struct hk_cfg g_cfg;
 static bool g_exiting;
 
-struct hk_cfi_scan {
-	const char *name;
-	size_t len;
-	unsigned long addr;
-};
+/*
+ * the body of a function whose address was taken is named name$type on a clang cfi
+ * build, and the suffix is not something a caller can know. the walk that used to
+ * find it goes through the kernel's symbol iterator, whose callback is four
+ * arguments on one kernel and three on another, and passing the wrong one is a cfi
+ * failure rather than a wrong answer. the stub the plain symbol names is a branch to
+ * that body, so the body is reached by following it, which costs no callback and no
+ * allocation and therefore also works from a probe handler
+ */
+#define HK_STUB_FOLLOW 8
 
-static int __nocfi hk_cfi_match(void *data, const char *name,
-				struct module *mod, unsigned long addr)
+static u32 hk_read_insn(unsigned long addr)
 {
-	struct hk_cfi_scan *scan = data;
+	u32 insn = 0;
 
-	if (strncmp(name, scan->name, scan->len) == 0 &&
-	    name[scan->len] == '$') {
-		scan->addr = addr;
-		return 1;
+	if (copy_from_kernel_nofault(&insn, (const void *)addr, sizeof(insn)))
+		return 0;
+	return insn;
+}
+
+static bool hk_insn_is_bti(u32 insn)
+{
+	return insn == 0xD503245F || insn == 0xD503249F || insn == 0xD50324DF ||
+	       insn == 0xD503251F;
+}
+
+static unsigned long __nocfi hk_follow_stub(unsigned long addr)
+{
+	int i;
+
+	for (i = 0; i < HK_STUB_FOLLOW; i++) {
+		u32 insn = hk_read_insn(addr);
+		long disp;
+
+		if (!insn)
+			return 0;
+		if (hk_insn_is_bti(insn)) {
+			addr += 4;
+			continue;
+		}
+		/* a bare branch at the entry is the stub the cfi build leaves behind */
+		if ((insn & 0xFC000000) != 0x14000000)
+			return addr;
+		disp = (long)(insn & 0x03FFFFFF) << 2;
+		if (disp & (1L << 27))
+			disp |= ~((1L << 28) - 1);
+		addr += disp;
 	}
 	return 0;
 }
 
-typedef int (*hk_symbol_walk_fn)(int (*fn)(void *, const char *,
-					   struct module *, unsigned long),
-				 void *data);
-
-/*
- * the clang CFI build keeps the plain name as a stub and renames the body to
- * name$type, so a caller cannot know the suffix and the symbol table is walked
- * once per miss. the walk itself is resolved through this same function, and one
- * flag keeps that second call from asking for the walk again: without it a kernel
- * whose symbol table cannot be reached recurses until the stack is gone
- */
-static bool g_cfi_walking;
-
 static unsigned long __nocfi hk_resolve_cfi(const char *name)
 {
-	hk_symbol_walk_fn walk;
-	struct hk_cfi_scan scan;
-	unsigned long addr;
+	unsigned long addr = 0;
 
-	if (g_cfi_walking)
+	/* asking hk_resolve here would ask this function again */
+	if (g_cfg.resolve && !g_exiting)
+		addr = g_cfg.resolve(name);
+	if (!addr || !hk_ker_addr_ok(addr))
 		return 0;
-	g_cfi_walking = true;
-	walk = (hk_symbol_walk_fn)hk_resolve("kallsyms_on_each_symbol");
-	if (!walk) {
-		g_cfi_walking = false;
-		return 0;
-	}
-	scan.name = name;
-	scan.len = strlen(name);
-	scan.addr = 0;
-	walk(hk_cfi_match, &scan);
-	g_cfi_walking = false;
-	addr = scan.addr;
-	return addr;
+	return hk_follow_stub(addr);
 }
 
 __nocfi noinline unsigned long hk_resolve(const char *name)

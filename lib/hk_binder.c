@@ -94,43 +94,6 @@ struct hk_cfi_search {
 	unsigned long addr;
 };
 
-static int __nocfi hk_binder_match_cfi(void *data, const char *name,
-				       struct module *mod, unsigned long addr)
-{
-	struct hk_cfi_search *s = data;
-
-	if (strncmp(name, s->name, s->len) == 0 && name[s->len] == '$') {
-		s->addr = addr;
-		return 1;
-	}
-	return 0;
-}
-
-typedef int (*hk_on_each_symbol_fn)(int (*fn)(void *, const char *,
-					      struct module *, unsigned long),
-				    void *data);
-
-static unsigned long __nocfi hk_binder_resolve_cfi(const char *name)
-{
-	hk_on_each_symbol_fn on_each;
-	struct hk_cfi_search search;
-	unsigned long addr;
-
-	addr = hk_resolve(name);
-	if (addr)
-		return addr;
-
-	on_each = (hk_on_each_symbol_fn)hk_resolve("kallsyms_on_each_symbol");
-	if (!on_each)
-		return 0;
-
-	search.name = name;
-	search.len = strlen(name);
-	search.addr = 0;
-	on_each(hk_binder_match_cfi, &search);
-	return search.addr;
-}
-
 long __nocfi hk_binder_ioctl_wrap(struct file *filp, unsigned int cmd,
 				  unsigned long arg)
 {
@@ -233,7 +196,7 @@ static int hk_binder_install(struct hk_inline *h, const char *sym,
 	unsigned long addr;
 	int ret;
 
-	addr = hk_binder_resolve_cfi(sym);
+	addr = hk_resolve(sym);
 	if (!addr)
 		return -ENOENT;
 
