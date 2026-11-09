@@ -8,9 +8,6 @@
 
 #include <linux/lsm_hooks.h>
 #include <linux/types.h>
-#include <linux/version.h>
-
-
 
 struct hk_lsm_layout {
 	unsigned long (*resolve)(const char *name);
@@ -30,6 +27,7 @@ struct hk_lsm_hook {
 	struct security_hook_list *entry;
 	/* set when the hook went in through a static call, NULL for the list route */
 	void *scall;
+	bool inserted;	/* set when the entry is ours, insert route */
 	/*
 	 * the node this library inserts when the list route is taken. it is this
 	 * library's own type because the kernel's changed shape in 6.12, and what the
@@ -58,6 +56,13 @@ struct hk_lsm_hook {
 int hk_lsm_init(const struct hk_lsm_layout *layout);
 void hk_lsm_exit(void);
 int hk_lsm_hook(struct hk_lsm_hook *hook);
+/*
+ * the same hook inserted instead of replaced: an own entry takes a free static
+ * call slot, every hook the kernel already had keeps running, and the original
+ * pointer is not touched. only a kernel with the static call table takes one, the
+ * list route has no rcu read section around its walk so a link could not be undone
+ */
+int hk_lsm_insert(struct hk_lsm_hook *hook);
 void hk_lsm_unhook(struct hk_lsm_hook *hook);
 int hk_lsm_register(struct hk_lsm_hook *hook);
 void hk_lsm_unregister(struct hk_lsm_hook *hook);

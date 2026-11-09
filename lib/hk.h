@@ -24,6 +24,25 @@ static inline bool hk_ker_addr_ok(unsigned long v)
 	return v >= 0xffff000000000000UL;
 }
 
+/*
+ * a probe replaces the word it lands on with brk, and a function built for bti
+ * starts with a landing pad, so the breakpoint takes the pad away and an indirect
+ * caller traps before the probe runs. arm64 leaves arch_adjust_kprobe_addr weak, so
+ * the placement stays with the caller: a handle that names one of these runs it once
+ * at install time, and NULL keeps the plain address the kernel would have used
+ */
+typedef int (*hk_probe_adjust_fn)(unsigned long addr, void *arg,
+				  unsigned long *out);
+
+/* the kernel's own predicate from 6.6 on, spelled here because 5.10 has no macro */
+static inline bool hk_insn_is_bti(u32 insn)
+{
+	return (insn & 0xFFFFFF3Fu) == 0xD503241Fu;
+}
+
+/* the preset, an entry without a pad lands as it came, which a direct call needs */
+int hk_kprobe_adjust_bti(unsigned long addr, void *arg, unsigned long *out);
+
 int hk_init(const struct hk_cfg *cfg);
 void hk_exit(void);
 unsigned long hk_resolve(const char *name);

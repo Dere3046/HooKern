@@ -343,7 +343,7 @@ static int hk_walk_pa(unsigned long addr, unsigned long *out,
 	p4d = p4d_offset(pgd, addr);
 	if (p4d_none(*p4d) || p4d_bad(*p4d))
 		return -ENOENT;
-#if defined(p4d_leaf)
+#ifdef p4d_leaf
 	if (p4d_leaf(*p4d)) {
 		*out = __p4d_to_phys(*p4d) + (addr & ~P4D_MASK);
 		if (desc)
@@ -356,7 +356,7 @@ static int hk_walk_pa(unsigned long addr, unsigned long *out,
 	pud = pud_offset(p4d, addr);
 	if (pud_none(*pud) || pud_bad(*pud))
 		return -ENOENT;
-#if defined(pud_leaf)
+#ifdef pud_leaf
 	if (pud_leaf(*pud)) {
 		*out = __pud_to_phys(*pud) + (addr & ~PUD_MASK);
 		if (desc)
@@ -369,7 +369,7 @@ static int hk_walk_pa(unsigned long addr, unsigned long *out,
 	pmd = pmd_offset(pud, addr);
 	if (pmd_none(*pmd))
 		return -ENOENT;
-#if defined(pmd_leaf)
+#ifdef pmd_leaf
 	if (pmd_leaf(*pmd)) {
 		*out = __pmd_to_phys(*pmd) + (addr & ~PMD_MASK);
 		if (desc)
@@ -889,7 +889,7 @@ static pte_t *hk_va_pte(struct mm_struct *mm, unsigned long addr, int *level)
 	p4d = p4d_offset(pgd, addr);
 	if (p4d_none(*p4d) || p4d_bad(*p4d))
 		return NULL;
-#if defined(p4d_leaf)
+#ifdef p4d_leaf
 	if (p4d_leaf(*p4d)) {
 		*level = HK_WALK_P4D;
 		return NULL;
@@ -898,7 +898,7 @@ static pte_t *hk_va_pte(struct mm_struct *mm, unsigned long addr, int *level)
 	pud = pud_offset(p4d, addr);
 	if (pud_none(*pud) || pud_bad(*pud))
 		return NULL;
-#if defined(pud_leaf)
+#ifdef pud_leaf
 	if (pud_leaf(*pud)) {
 		*level = HK_WALK_PUD;
 		return NULL;
@@ -907,7 +907,7 @@ static pte_t *hk_va_pte(struct mm_struct *mm, unsigned long addr, int *level)
 	pmd = pmd_offset(pud, addr);
 	if (pmd_none(*pmd))
 		return NULL;
-#if defined(pmd_leaf)
+#ifdef pmd_leaf
 	if (pmd_leaf(*pmd)) {
 		*level = HK_WALK_PMD;
 		return NULL;

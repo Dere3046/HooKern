@@ -4,9 +4,11 @@
  */
 
 #include <linux/delay.h>
+#include <linux/errno.h>
 #include <linux/module.h>
 #include <linux/printk.h>
 #include <linux/string.h>
+#include <linux/uaccess.h>
 
 #include "hk.h"
 #include "hk_ptr.h"
@@ -38,12 +40,6 @@ static u32 hk_read_insn(unsigned long addr)
 	if (copy_from_kernel_nofault(&insn, (const void *)addr, sizeof(insn)))
 		return 0;
 	return insn;
-}
-
-static bool hk_insn_is_bti(u32 insn)
-{
-	return insn == 0xD503245F || insn == 0xD503249F || insn == 0xD50324DF ||
-	       insn == 0xD503251F;
 }
 
 static unsigned long __nocfi hk_follow_stub(unsigned long addr)
@@ -97,6 +93,19 @@ __nocfi noinline unsigned long hk_resolve(const char *name)
 	addr = hk_resolve_cfi(name);
 	if (addr && hk_ker_addr_ok(addr))
 		return addr;
+	return 0;
+}
+
+int hk_kprobe_adjust_bti(unsigned long addr, void *arg, unsigned long *out)
+{
+	u32 insn;
+
+	(void)arg;
+	if (!addr || !out)
+		return -EINVAL;
+	if (copy_from_kernel_nofault(&insn, (const void *)addr, sizeof(insn)))
+		return -EFAULT;
+	*out = addr + (hk_insn_is_bti(insn) ? 4 : 0);
 	return 0;
 }
 

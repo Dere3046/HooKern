@@ -462,22 +462,25 @@ for a window it reports as HK_INLINE_UNSUPPORTED.
 
 **int hk_kprobe_install(struct hk_kprobe *h, const char *sym, kprobe_pre_handler_t pre)**
 
-register a kprobe on sym with the given pre handler. the resolved
-address lands in h->orig. register_kprobe and unregister_kprobe are
-resolved at runtime through `__nocfi` wrappers, some GKI builds trim
-the exports, a missing symbol fails with -ENODATA. a refused install
-logs the symbol, the kernel code and the gate that fired, and returns
-the kernel code: -EINVAL for every address gate, -ENOENT for a symbol
-that does not resolve. -ENOMEM when the tracking node cannot be
-allocated, nothing is registered then, there is no ceiling on the
-number of live probes. hk_kprobe_remove logs when the probe cannot be
-unregistered again, a probe left armed on module text is a use after
-free, and a second remove of the same hook is a no op.
+register a kprobe on sym with the given pre handler. the address asked
+for lands in h->orig and the word the probe took lands in h->kp.addr,
+the two differ when the handle named an adjust. register_kprobe and
+unregister_kprobe are resolved at runtime through `__nocfi` wrappers,
+some GKI builds trim the exports, a missing symbol fails with -ENODATA.
+a refused install logs the symbol, the kernel code and the gate that
+fired, and returns the kernel code: -EINVAL for every address gate,
+-ENOENT for a symbol that does not resolve. -ENOMEM when the tracking
+node cannot be allocated, nothing is registered then, there is no
+ceiling on the number of live probes. hk_kprobe_remove logs when the
+probe cannot be unregistered again, a probe left armed on module text is
+a use after free, and a second remove of the same hook is a no op.
 
 ```c
 struct hk_kprobe {
-	struct kprobe kp;
-	unsigned long orig;
+	struct kprobe kp;	/* kp.addr is where the probe landed */
+	unsigned long orig;	/* the address asked for */
+	hk_probe_adjust_fn adjust;	/* read before the install */
+	void *arg;			/* read before the install */
 };
 ```
 
@@ -488,6 +491,27 @@ entry it read itself, or a function whose name it does not want the
 resolver to see. addr has to be kernel or module text, which is the same
 gate the kernel asks, and the tracking, the count of live probes and the
 exit path are the ones hk_kprobe_install uses. h->orig is addr.
+
+**int hk_kprobe_adjust_bti(unsigned long addr, void *arg, unsigned long \*out)**
+
+the preset the library ships, assign it to adjust. a target built for
+bti starts with a landing pad and the probe replaces that word with brk,
+which takes the pad away and traps the indirect caller before the
+handler runs; arm64 leaves arch_adjust_kprobe_addr weak, so the
+placement belongs to the handle. the word is judged with the kernel's
+own predicate, a pad is skipped and an entry without one lands as it
+came. it runs once at install time, a negative return refuses the
+install, -EINVAL on a NULL argument.
+
+```c
+typedef int (*hk_probe_adjust_fn)(unsigned long addr, void *arg,
+				  unsigned long *out);
+
+static inline bool hk_insn_is_bti(u32 insn);
+```
+
+a handle that names a function of that type decides the landing word
+itself, the rule is the caller's and h->kp.addr reports what was taken.
 
 **int hk_kprobe_check(const char *sym, struct hk_kprobe_report *out)**
 
@@ -698,7 +722,9 @@ from a path the compiler did not build.
 
 **int hk_kretprobe_install(struct hk_kretprobe *h, const char *sym, kretprobe_handler_t handler)**
 
-register a kretprobe on sym. the handler signature is the kernel one
+register a kretprobe on sym. it registers a kprobe on the entry, so the
+handle carries adjust and arg like hk_kprobe does and the same preset
+applies. the handler signature is the kernel one
 (struct kretprobe_instance, struct pt_regs), it runs after the target
 returned and the return value is in x0, so hk_regs_set_ret rewrites it,
 which a kprobe cannot do. the kernel writes the registers back after
@@ -770,10 +796,10 @@ struct hk_binder_callbacks {
 
 ## LSM hook
 
-LSM hook is an optional component compiled with `HK_LSM=1`. it
-replaces existing LSM hook slots at runtime. Type_info is vendored
-under deps/Type_info and injected through a pointer layout, so the
-library does not link Type_info directly.
+LSM hook is an optional component, linked by adding lib/hk_lsm.o, no
+flag. it replaces or inserts LSM hook slots at runtime. Type_info is
+vendored under deps/Type_info and injected through a pointer layout, so
+the library does not link Type_info directly.
 
 ```c
 struct hk_lsm_layout {
@@ -787,18 +813,34 @@ struct hk_lsm_layout {
 
 **int hk_lsm_init(const struct hk_lsm_layout *layout)**
 
-store the injected Type_info layout. must be called before any
-hk_lsm_hook.
+copy the injected Type_info layout, a layout on the caller's stack is
+fine. NULL drops it. must be called before any hk_lsm_hook.
 
 **int hk_lsm_hook(struct hk_lsm_hook *hook)**
 
-find the LSM slot whose current handler matches target_name and
-replace it with replacement. supports legacy security_hook_heads
-(< 6.12) and static_calls_table (>= 6.12).
+find the LSM slot whose current handler matches target_name and replace
+it with replacement. the route is a runtime question and the two are
+exclusive: a kernel that publishes security_hook_heads walks the list
+and patches the entry, one that does not patches the static call of
+static_calls_table. -ENOENT when no slot carries the target,
+-EOPNOTSUPP when the static call route has no type source to read the
+two structures from.
+
+**int hk_lsm_insert(struct hk_lsm_hook *hook)**
+
+insert an own entry instead of replacing one: every registered hook keeps
+running, target_name and original stay unused, and the entry runs after
+them, so an int hook that denied earlier short circuits before it. only
+the static call route takes one, the list route has no rcu read section
+around its walk and a link could not be taken back, so it answers
+-EOPNOTSUPP there. the slot is the first free one, the way the kernel
+registers an lsm itself. unhook disables its branch, waits one tasks rcu
+period and clears the call, and the module still unloads.
 
 **void hk_lsm_unhook(struct hk_lsm_hook *hook)**
 
-restore the original handler and untrack the hook.
+restore the original handler, or take an inserted one back, and untrack
+the hook.
 
 **int hk_lsm_register(struct hk_lsm_hook *hook)** and **void
 hk_lsm_unregister(struct hk_lsm_hook *hook)** are aliases of
@@ -813,13 +855,13 @@ restore all tracked hooks and clear the injected layout.
 	{                                                              \
 		.head_name = #member,                                  \
 		.target_name = target_symbol,                          \
-		.head_offset = offsetof(HK_LSM_HEADS_TYPE, member),    \
-		.hook_offset = offsetof(struct security_hook_list, hook.member),\
 		.replacement = (void *)(replacement_fn),               \
-		.offset = off,                                         \
+		.offset = (off),                                       \
 	}
 ```
 
-when a Type_info layout is injected, hk_lsm uses layout->member_off
-to resolve security_hook_list and lsm_static_call offsets at runtime,
-so compile-time offsetof values are only a fallback.
+with a Type_info layout every offset comes from layout->member_off at
+runtime. without one the head is found by scanning the heads for the one
+that carries the target and the caller sets hook_offset itself, which is
+the state a kernel without a type source runs in.
+

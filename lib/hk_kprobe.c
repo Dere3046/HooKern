@@ -248,9 +248,7 @@ static int hk_kprobe_add(struct hk_kprobe *h, unsigned long addr)
 		hk_kprobe_fail_route(h, ret);
 		return ret;
 	}
-	h->orig = (unsigned long)h->kp.addr;
-	if (!h->orig)
-		h->orig = addr;
+	h->orig = addr ? addr : (unsigned long)h->kp.addr;
 
 	node->hook = h;
 	spin_lock_irqsave(&g_kprobe_lock, flags);
@@ -262,30 +260,89 @@ static int hk_kprobe_add(struct hk_kprobe *h, unsigned long addr)
 	return 0;
 }
 
+/*
+ * the caller named a landing rule, so the address the kernel would have used is
+ * resolved here and handed to it once. a handle without one keeps the kernel's own
+ * lookup and takes no new path
+ */
+static int hk_kprobe_adjust_route(struct hk_kprobe *h, const char *sym,
+				  unsigned long *requested)
+{
+	unsigned long addr;
+	unsigned long out;
+	int ret;
+
+	if (!h->adjust)
+		return 0;
+
+	addr = sym ? hk_resolve(sym) : *requested;
+	if (!addr)
+		return -ENOENT;
+
+	out = addr;
+	ret = h->adjust(addr, h->arg, &out);
+	if (ret)
+		return ret;
+
+	*requested = addr;
+	h->kp.symbol_name = NULL;
+	h->kp.addr = (kprobe_opcode_t *)out;
+	return 0;
+}
+
 int hk_kprobe_install(struct hk_kprobe *h, const char *sym,
 		      kprobe_pre_handler_t pre)
 {
+	hk_probe_adjust_fn adjust;
+	unsigned long requested = 0;
+	void *arg;
+	int ret;
+
 	if (!h || !sym || !pre)
 		return -EINVAL;
 
+	/* what the caller named before the call, everything else is set here */
+	adjust = h->adjust;
+	arg = h->arg;
+
 	memset(h, 0, sizeof(*h));
+	h->adjust = adjust;
+	h->arg = arg;
 	h->kp.symbol_name = sym;
 	h->kp.pre_handler = pre;
 
-	return hk_kprobe_add(h, 0);
+	ret = hk_kprobe_adjust_route(h, sym, &requested);
+	if (ret)
+		return ret;
+
+	return hk_kprobe_add(h, requested);
 }
 
 int hk_kprobe_install_at(struct hk_kprobe *h, unsigned long addr,
 			 kprobe_pre_handler_t pre)
 {
+	hk_probe_adjust_fn adjust;
+	unsigned long requested = addr;
+	void *arg;
+	int ret;
+
 	if (!h || !addr || !pre)
 		return -EINVAL;
 
+	adjust = h->adjust;
+	arg = h->arg;
+
 	memset(h, 0, sizeof(*h));
+	h->adjust = adjust;
+	h->arg = arg;
 	h->kp.addr = (kprobe_opcode_t *)addr;
 	h->kp.pre_handler = pre;
 
-	return hk_kprobe_add(h, addr);
+	ret = hk_kprobe_adjust_route(h, NULL, &requested);
+	if (ret)
+		return ret;
+
+	return hk_kprobe_add(h, requested);
 }
 
 int hk_kprobe_remove(struct hk_kprobe *h)

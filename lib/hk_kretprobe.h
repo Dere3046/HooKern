@@ -9,8 +9,13 @@
 #include <linux/kprobes.h>
 #include <linux/types.h>
 
+#include "hk.h"
+
 struct hk_kretprobe {
-	struct kretprobe rp;
+	struct kretprobe rp;	/* rp.kp.addr is where the probe landed */
+	unsigned long orig;	/* the address asked for */
+	hk_probe_adjust_fn adjust;	/* read before the install */
+	void *arg;			/* read before the install */
 };
 
 /*
