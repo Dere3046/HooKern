@@ -152,85 +152,28 @@ static int hk_kretprobe_add(struct hk_kretprobe *h)
 	return 0;
 }
 
-/* the caller named a landing rule, so the address is adjusted here once */
-static int hk_kretprobe_adjust_route(struct hk_kretprobe *h, const char *sym,
-				     unsigned long *requested)
-{
-	unsigned long addr;
-	unsigned long out;
-	int ret;
-
-	if (!h->adjust)
-		return 0;
-
-	addr = sym ? hk_resolve(sym) : *requested;
-	if (!addr)
-		return -ENOENT;
-
-	out = addr;
-	ret = h->adjust(addr, h->arg, &out);
-	if (ret)
-		return ret;
-
-	*requested = addr;
-	h->rp.kp.symbol_name = NULL;
-	h->rp.kp.addr = (kprobe_opcode_t *)out;
-	return 0;
-}
-
 int hk_kretprobe_install(struct hk_kretprobe *h, const char *sym,
 			 kretprobe_handler_t handler)
 {
-	hk_probe_adjust_fn adjust;
-	unsigned long requested = 0;
-	void *arg;
-	int ret;
-
 	if (!h || !sym || !handler)
 		return -EINVAL;
 
-	adjust = h->adjust;
-	arg = h->arg;
-
 	memset(h, 0, sizeof(*h));
-	h->adjust = adjust;
-	h->arg = arg;
 	h->rp.kp.symbol_name = sym;
 	h->rp.handler = handler;
-
-	ret = hk_kretprobe_adjust_route(h, sym, &requested);
-	if (ret)
-		return ret;
-
-	h->orig = requested;
 	return hk_kretprobe_add(h);
 }
 
 int hk_kretprobe_install_at(struct hk_kretprobe *h, unsigned long addr,
 			    kretprobe_handler_t handler)
 {
-	hk_probe_adjust_fn adjust;
-	unsigned long requested = addr;
-	void *arg;
-	int ret;
-
 	if (!h || !addr || !handler)
 		return -EINVAL;
 
-	adjust = h->adjust;
-	arg = h->arg;
-
 	memset(h, 0, sizeof(*h));
-	h->adjust = adjust;
-	h->arg = arg;
 	h->rp.kp.addr = (kprobe_opcode_t *)addr;
 	h->rp.handler = handler;
-
-	ret = hk_kretprobe_adjust_route(h, NULL, &requested);
-	if (ret)
-		return ret;
-
-	h->orig = requested;
+	h->orig = addr;
 	return hk_kretprobe_add(h);
 }
 
@@ -239,36 +182,21 @@ int hk_kretprobe_install_ex(struct hk_kretprobe *h, const char *sym,
 			    kretprobe_handler_t handler,
 			    size_t data_size)
 {
-	hk_probe_adjust_fn adjust;
-	unsigned long requested = 0;
 	struct hk_kretprobe_node *node;
-	void *arg;
 	int ret;
 
 	if (!h || !sym || !handler)
 		return -EINVAL;
-
-	adjust = h->adjust;
-	arg = h->arg;
 
 	node = hk_kretprobe_node_alloc(sym);
 	if (!node)
 		return -ENOMEM;
 
 	memset(h, 0, sizeof(*h));
-	h->adjust = adjust;
-	h->arg = arg;
 	h->rp.kp.symbol_name = sym;
 	h->rp.entry_handler = entry;
 	h->rp.handler = handler;
 	h->rp.data_size = data_size;
-
-	ret = hk_kretprobe_adjust_route(h, sym, &requested);
-	if (ret) {
-		kfree(node);
-		return ret;
-	}
-	h->orig = requested;
 
 	ret = call_register_kretprobe(&h->rp);
 	if (ret < 0) {

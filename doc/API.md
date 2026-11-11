@@ -492,26 +492,38 @@ resolver to see. addr has to be kernel or module text, which is the same
 gate the kernel asks, and the tracking, the count of live probes and the
 exit path are the ones hk_kprobe_install uses. h->orig is addr.
 
-**int hk_kprobe_adjust_bti(unsigned long addr, void *arg, unsigned long \*out)**
+**int hk_kprobe_adjust_pad(unsigned long addr, void *arg, unsigned long \*out)**
 
-the preset the library ships, assign it to adjust. a target built for
-bti starts with a landing pad and the probe replaces that word with brk,
-which takes the pad away and traps the indirect caller before the
-handler runs; arm64 leaves arch_adjust_kprobe_addr weak, so the
-placement belongs to the handle. the word is judged with the kernel's
-own predicate, a pad is skipped and an entry without one lands as it
-came. it runs once at install time, a negative return refuses the
-install, -EINVAL on a NULL argument.
+the preset the library ships, assign it to adjust. an entry an indirect
+branch reaches starts with a landing pad: a bti, or the pac prologue the
+compiler writes instead of one. the probe replaces that word with brk,
+which takes the pad away and traps the caller before the handler runs,
+and a pac prologue the preset leaves behind has already signed the link
+register, which a handler that parks the pc would hand to the cpu as a bad
+address.
+the preset walks the pads and stops on the body word, before the frame is
+set up, so a handler that returns early leaves nothing to unwind. an
+entry without a pad lands as it came, and an entry whose first four words
+are all pads is refused because no body was found. it runs once at
+install time, a negative return refuses the install, -EINVAL on a NULL
+argument, -EOPNOTSUPP for the pad run.
 
 ```c
 typedef int (*hk_probe_adjust_fn)(unsigned long addr, void *arg,
 				  unsigned long *out);
 
 static inline bool hk_insn_is_bti(u32 insn);
+static inline bool hk_insn_is_pad(u32 insn);
+static inline unsigned long hk_pac_strip(unsigned long v);
 ```
 
+hk_insn_is_bti is the kernel's own predicate, the four hint forms;
+hk_insn_is_pad adds the two pac prologues; hk_pac_strip clears the
+signature a pac prologue left on a link register, a hint that is a no op
+on a cpu without pac.
+
 a handle that names a function of that type decides the landing word
-itself, the rule is the caller's and h->kp.addr reports what was taken.
+itself. the rule is the caller's and h->kp.addr reports what was taken.
 
 **int hk_kprobe_check(const char *sym, struct hk_kprobe_report *out)**
 
@@ -543,9 +555,11 @@ report on an address never carries HK_KPROBE_UNRESOLVED or the cfi
 preamble state, both of those are about a name.
 
 the gates are the kprobe ones for a kretprobe too, register_kretprobe
-registers a kprobe. HK_KPROBE_OK is not a promise, an install can still
-fail on a kernel symbol the resolver cannot reach or on a tracking node
-that cannot be allocated.
+registers a kprobe, and a kretprobe needs the function entry on top of
+them, which register_kretprobe enforces itself and this report cannot
+see. HK_KPROBE_OK is not a promise, an install can still fail on a
+kernel symbol the resolver cannot reach or on a tracking node that
+cannot be allocated.
 
 **handler helpers**
 
@@ -559,7 +573,9 @@ over the probed instruction for a pre handler that returns 1.
 the replacement idiom for a hot target is hk_regs_return, it parks the
 pc on the link register so the target returns at once with x0 as the
 result and its prologue never runs, which is as close to a wrapper as a
-probe gets:
+probe gets. the pad preset lands the probe before the frame, and a probe
+behind a pac prologue reads a signed link register, so the helper strips
+it, writes the clean value back and parks the pc on it:
 
 ```c
 static int pre(struct kprobe *p, struct pt_regs *regs)
@@ -577,9 +593,11 @@ and its return goes to the caller of the target, so what it returns is
 what the target returns. it is reached by the return from the breakpoint
 exception and not by a branch, so no cfi check and no bti landing pad
 stands at its entry, and the target does not run unless the replacement
-calls it. a handler that redirects returns 1 like one that parks the pc,
-and reaching the original again is the address of the probed entry, which
-is what hk_redir below is about.
+calls it. the link register is stripped before the hand over, so the
+replacement returns to the caller and not to a signed address. a handler
+that redirects returns 1 like one that parks the pc, and reaching the
+original again is the address of the probed entry, which is what hk_redir
+below is about.
 
 **int hk_kprobe_remove(struct hk_kprobe *h)** unregisters and untracks, 0
 when the probe is gone and -ENODATA when unregister_kprobe cannot be
@@ -722,21 +740,27 @@ from a path the compiler did not build.
 
 **int hk_kretprobe_install(struct hk_kretprobe *h, const char *sym, kretprobe_handler_t handler)**
 
-register a kretprobe on sym. it registers a kprobe on the entry, so the
-handle carries adjust and arg like hk_kprobe does and the same preset
-applies. the handler signature is the kernel one
-(struct kretprobe_instance, struct pt_regs), it runs after the target
-returned and the return value is in x0, so hk_regs_set_ret rewrites it,
-which a kprobe cannot do. the kernel writes the registers back after
-the handler. register_kretprobe and unregister_kretprobe are runtime
-resolved like the kprobe ones. the address gates are the kprobe ones,
-so hk_kprobe_check answers for a kretprobe target, and a refused
-install logs the symbol, the kernel code and the gate. installs are
-tracked in a list like the kprobe ones, no ceiling and no -ENOSPC,
--ENOMEM when the tracking node cannot be allocated. the target has to
-return, a function that never returns leaks instances until maxactive
-runs out and the probe then misses returns instead of failing the
-install.
+register a kretprobe on sym. it registers a kprobe on the function entry
+and the kernel enforces that address: kprobe_on_func_entry refuses every
+other word and arm64 has no arch_adjust_kprobe_addr override to present a
+shifted one as the entry, so a kretprobe cannot skip a landing pad. the
+breakpoint takes the first word, and a function that starts with a pad
+loses it, so an indirect caller of that function traps bti. a padded
+target that is called indirectly has no kretprobe landing: a kprobe with
+hk_kprobe_adjust_pad keeps the pad, at the price of not rewriting the
+return value.
+the handler signature is the kernel one (struct kretprobe_instance, struct
+pt_regs), it runs after the target returned and the return value is in x0,
+so hk_regs_set_ret rewrites it, which a kprobe cannot do. the kernel
+writes the registers back after the handler. register_kretprobe and
+unregister_kretprobe are runtime resolved like the kprobe ones. the
+address gates are the kprobe ones, so hk_kprobe_check answers for a
+kretprobe target, and the entry gate is on top of them: a shifted address
+fails with -EINVAL, which the report cannot see. installs are tracked in
+a list like the kprobe ones, no ceiling and no -ENOSPC, -ENOMEM when the
+tracking node cannot be allocated. the target has to return, a function
+that never returns leaks instances until maxactive runs out and the probe
+then misses returns instead of failing the install.
 
 **int hk_kretprobe_install_ex(struct hk_kretprobe *h, const char *sym, kretprobe_handler_t entry, kretprobe_handler_t handler, size_t data_size)**
 
@@ -747,6 +771,7 @@ which the return handler reads back from the same instance.
 ```c
 struct hk_kretprobe {
 	struct kretprobe rp;
+	unsigned long orig;	/* the address asked for */
 };
 ```
 
@@ -754,8 +779,9 @@ struct hk_kretprobe {
 
 the same for a target the caller holds as an address, which is what a
 function of its own needs: a completion signal has to sit on the
-replacement, and a replacement is a pointer, not a name. the gates, the
-tracking and the exit path are the ones hk_kretprobe_install uses.
+replacement, and a replacement is a pointer, not a name. the address has
+to be the function entry, the kernel refuses every other one. the gates,
+the tracking and the exit path are the ones hk_kretprobe_install uses.
 
 **int hk_kretprobe_remove(struct hk_kretprobe *h)** and **void
 hk_kretprobe_exit(void)** mirror the kprobe ones, including the log line

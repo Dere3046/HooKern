@@ -25,11 +25,13 @@ static inline bool hk_ker_addr_ok(unsigned long v)
 }
 
 /*
- * a probe replaces the word it lands on with brk, and a function built for bti
- * starts with a landing pad, so the breakpoint takes the pad away and an indirect
- * caller traps before the probe runs. arm64 leaves arch_adjust_kprobe_addr weak, so
- * the placement stays with the caller: a handle that names one of these runs it once
- * at install time, and NULL keeps the plain address the kernel would have used
+ * a probe replaces the word it lands on with brk, and an entry that an indirect
+ * branch reaches starts with a landing pad, so the breakpoint takes the pad away
+ * and the caller traps before the probe runs. the pac prologue is a landing pad
+ * too, and behind it the link register is signed, which is the other half of the
+ * same problem. arm64 leaves arch_adjust_kprobe_addr weak, so the placement stays
+ * with the caller: a handle that names one of these runs it once at install time,
+ * and NULL keeps the plain address the kernel would have used
  */
 typedef int (*hk_probe_adjust_fn)(unsigned long addr, void *arg,
 				  unsigned long *out);
@@ -40,8 +42,34 @@ static inline bool hk_insn_is_bti(u32 insn)
 	return (insn & 0xFFFFFF3Fu) == 0xD503241Fu;
 }
 
-/* the preset, an entry without a pad lands as it came, which a direct call needs */
-int hk_kprobe_adjust_bti(unsigned long addr, void *arg, unsigned long *out);
+/* the hint words an entry can start with that an indirect branch may target:
+ * the bti family and the two pac prologues, which act as the pad when the
+ * compiler writes one instead of a bti. bti r only answers a return, and is
+ * skipped with the rest because leaving a hint behind costs nothing */
+static inline bool hk_insn_is_pad(u32 insn)
+{
+	return hk_insn_is_bti(insn) || insn == 0xD503233Fu ||
+	       insn == 0xD503237Fu;
+}
+
+/*
+ * behind a pac prologue the link register is signed, so a handler that parks the
+ * pc or hands the call on has to strip it first or the cpu gets an address no
+ * branch can take. the strip is a hint, a no op on a cpu without pac, and an
+ * address that was never signed comes back unchanged
+ */
+static inline unsigned long hk_pac_strip(unsigned long v)
+{
+	register unsigned long lr asm("x30") = v;
+
+	asm("hint #7" : "+r"(lr));
+	return lr;
+}
+
+/* the kprobe preset: skip the pads and stop on the body word, which is before the
+ * frame is set up, so a handler that returns early leaves nothing to unwind. an
+ * entry without a pad lands as it came, and a run of four pads is refused */
+int hk_kprobe_adjust_pad(unsigned long addr, void *arg, unsigned long *out);
 
 int hk_init(const struct hk_cfg *cfg);
 void hk_exit(void);

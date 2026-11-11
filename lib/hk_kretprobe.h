@@ -14,8 +14,6 @@
 struct hk_kretprobe {
 	struct kretprobe rp;	/* rp.kp.addr is where the probe landed */
 	unsigned long orig;	/* the address asked for */
-	hk_probe_adjust_fn adjust;	/* read before the install */
-	void *arg;			/* read before the install */
 };
 
 /*
@@ -36,6 +34,13 @@ struct hk_kretprobe {
  * per call until maxactive runs out, and the probe then misses returns instead
  * of failing the install. a hot target other cores execute during
  * installation still belongs here, never to hk_inline_hook
+ *
+ * the probe sits on the function entry and the kernel enforces it:
+ * kprobe_on_func_entry refuses every other address, and arm64 has no
+ * arch_adjust_kprobe_addr override to present a shifted word as the entry. the
+ * breakpoint takes that first word, so a function that starts with a landing pad
+ * loses it and an indirect caller then traps bti. the kprobe route with its pad
+ * walk is for those, a kretprobe has no landing to give
  */
 int hk_kretprobe_install(struct hk_kretprobe *h, const char *sym,
 			 kretprobe_handler_t handler);
@@ -46,7 +51,8 @@ int hk_kretprobe_install_ex(struct hk_kretprobe *h, const char *sym,
 /*
  * the same for a target the caller holds as an address, which is what a function
  * of its own needs: a completion signal has to sit on the replacement, and a
- * replacement is a pointer, not a name
+ * replacement is a pointer, not a name. the address has to be the function entry,
+ * the kernel refuses every other one
  */
 int hk_kretprobe_install_at(struct hk_kretprobe *h, unsigned long addr,
 			    kretprobe_handler_t handler);

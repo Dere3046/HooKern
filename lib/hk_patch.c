@@ -333,6 +333,9 @@ static int hk_walk_pa(unsigned long addr, unsigned long *out,
 	pmd_t *pmd;
 	pte_t *pte;
 
+	/* a non kernel address has no entry in init_mm, walk nothing */
+	if (!hk_ker_addr_ok(addr))
+		return -EINVAL;
 	mm = (struct mm_struct *)hk_resolve("init_mm");
 	if (!mm || !hk_ker_addr_ok((unsigned long)mm))
 		return -ENOENT;
@@ -1206,6 +1209,9 @@ int hk_write_kernel(void *dst, const void *src, size_t len)
 
 	if (!dst || !src || !len || (len & 3))
 		return -EINVAL;
+	/* a store outside the kernel mapping has no page to land on */
+	if (!hk_ker_addr_ok(addr))
+		return -EIO;
 	/*
 	 * the kernel sends everything that is not its own text to vmalloc_to_page,
 	 * and that cannot answer a block mapped address before 5.13: it warns and

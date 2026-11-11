@@ -96,16 +96,30 @@ __nocfi noinline unsigned long hk_resolve(const char *name)
 	return 0;
 }
 
-int hk_kprobe_adjust_bti(unsigned long addr, void *arg, unsigned long *out)
+/* a compiler writes at most a bti and a pac prologue, so four words cover every
+ * entry; an entry whose first four words are all pads has no body behind them */
+#define HK_PAD_MAX 4
+
+int hk_kprobe_adjust_pad(unsigned long addr, void *arg, unsigned long *out)
 {
-	u32 insn;
+	unsigned int i;
 
 	(void)arg;
 	if (!addr || !out)
 		return -EINVAL;
-	if (copy_from_kernel_nofault(&insn, (const void *)addr, sizeof(insn)))
-		return -EFAULT;
-	*out = addr + (hk_insn_is_bti(insn) ? 4 : 0);
+	for (i = 0; i < HK_PAD_MAX; i++) {
+		u32 insn;
+
+		if (copy_from_kernel_nofault(&insn, (const void *)addr,
+					     sizeof(insn)))
+			return -EFAULT;
+		if (!hk_insn_is_pad(insn))
+			break;
+		addr += 4;
+	}
+	if (i == HK_PAD_MAX)
+		return -EOPNOTSUPP;
+	*out = addr;
 	return 0;
 }
 

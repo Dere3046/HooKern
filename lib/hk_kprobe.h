@@ -181,8 +181,10 @@ static inline void hk_regs_skip(struct pt_regs *regs)
  * the replacement idiom for a hot target: a pre handler that returns 1 stops the
  * kernel from running the probed instruction, so parking the pc on the link
  * register returns from the target at once with x0 as the result, the way a
- * wrapper would. the prologue of the target has not run yet, so nothing is left
- * to unwind
+ * wrapper would. the pad walk places the probe on the body word, before the frame
+ * is set up, so nothing is left to unwind, and a probe that sits behind a pac
+ * prologue reads a signed link register, which is stripped and written back here,
+ * the way the epilogue the target skipped would have left it
  *
  *	hk_regs_set_ret(regs, my_device_add(hk_regs_arg(regs, 0)));
  *	hk_regs_return(regs);
@@ -190,6 +192,7 @@ static inline void hk_regs_skip(struct pt_regs *regs)
  */
 static inline void hk_regs_return(struct pt_regs *regs)
 {
+	regs->regs[30] = hk_pac_strip(regs->regs[30]);
 	regs->pc = regs->regs[30];
 }
 
@@ -201,13 +204,16 @@ static inline void hk_regs_return(struct pt_regs *regs)
  * exception and not by a branch, so no bti landing pad and no cfi check stands at
  * its entry, and the target never runs unless the replacement calls it
  *
- * a handler that redirects returns 1, exactly like one that parks the pc. reaching
- * the original again is the address of the probed entry: the breakpoint fires a
- * second time and the handler has to let that call through, which is what the guard
- * of hk_redir is for
+ * a handler that redirects returns 1, exactly like one that parks the pc. the link
+ * register is stripped before the hand over, so the replacement returns to the
+ * caller and not to an address the pac prologue signed. reaching the original
+ * again is the address of the probed entry: the breakpoint fires a second time and
+ * the handler has to let that call through, which is what the guard of hk_redir is
+ * for
  */
 static inline void hk_regs_redirect(struct pt_regs *regs, unsigned long fn)
 {
+	regs->regs[30] = hk_pac_strip(regs->regs[30]);
 	regs->pc = fn;
 }
 #endif
