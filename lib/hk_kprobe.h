@@ -123,8 +123,13 @@ struct hk_kprobe_report {
  *
  * 0 when the report was filled, -EINVAL on a NULL argument. HK_KPROBE_OK means
  * no address gate matched, an install can still fail on a kernel symbol the
- * resolver cannot reach or on a tracking node that cannot be allocated. the
- * same gates guard a kretprobe, register_kretprobe registers a kprobe
+ * resolver cannot reach or on a tracking node that cannot be allocated
+ *
+ * the report is about the address gates only: it does not judge a landing pad,
+ * the frame, or whether a handler may return early. that is the adjust the
+ * caller names, and hk_kprobe_adjust_pad answers the pad part when it is called
+ * directly. a kretprobe also needs the function entry, which register_kretprobe
+ * enforces itself and this report cannot see
  */
 int hk_kprobe_check(const char *sym, struct hk_kprobe_report *out);
 /* the same gates on an address, for a target that was never a symbol */
@@ -171,10 +176,56 @@ static inline unsigned long hk_regs_lr(const struct pt_regs *regs)
 	return regs->regs[30];
 }
 
-/* a pre handler that returns 1 must step the pc over the probed instruction */
-static inline void hk_regs_skip(struct pt_regs *regs)
+/*
+ * the words a prologue uses to build or save the frame, which the epilogue
+ * restores from. a skip over one of them leaves the stack and the frame
+ * pointer in a state the function does not expect
+ */
+static inline bool hk_insn_is_frame(u32 insn)
 {
+	switch (insn & 0xFFC00000u) {
+	case 0xA9800000u:	/* stp pre index */
+	case 0xA9000000u:	/* stp offset */
+	case 0xA8800000u:	/* stp post index */
+	case 0x29800000u:	/* stp 32 pre index */
+	case 0x29000000u:	/* stp 32 offset */
+	case 0x28800000u:	/* stp 32 post index */
+		if ((insn & 0x3E0u) == 0x3E0u)
+			return true;
+		break;
+	}
+	if ((insn & 0xFFC00000u) == 0xF8000000u ||
+	    (insn & 0xFFC00000u) == 0xF9000000u ||
+	    (insn & 0xFFC00000u) == 0xB8000000u ||
+	    (insn & 0xFFC00000u) == 0xB9000000u) {
+		if ((insn & 0x3E0u) == 0x3E0u)
+			return true;
+	}
+	if ((insn & 0xFFC003FFu) == 0xD10003FFu ||
+	    (insn & 0xFFC003FFu) == 0xD14003FFu ||
+	    (insn & 0xFFC003FFu) == 0x910003FFu ||
+	    (insn & 0xFFC003FFu) == 0x914003FFu)
+		return true;
+	return insn == 0x910003FDu || insn == 0x910003BFu;
+}
+
+/*
+ * a pre handler that returns 1 must step the pc over the probed instruction.
+ * the word is p->opcode and not the one at regs->pc, which is the brk. a pad or
+ * a frame word is refused: the pad has to stay and the frame the epilogue
+ * restores is built by that word. 0 when the pc moved, -EINVAL on a NULL probe,
+ * -EOPNOTSUPP for those words, and the pc is unchanged on an error, so the
+ * handler must not return 1 then
+ */
+static inline int hk_regs_skip(struct kprobe *p, struct pt_regs *regs)
+{
+	if (!p)
+		return -EINVAL;
+	if (hk_insn_is_pad((u32)p->opcode) ||
+	    hk_insn_is_frame((u32)p->opcode))
+		return -EOPNOTSUPP;
 	regs->pc += 4;
+	return 0;
 }
 
 /*

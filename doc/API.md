@@ -554,12 +554,15 @@ the same gates on an address, for a target that never was a symbol. a
 report on an address never carries HK_KPROBE_UNRESOLVED or the cfi
 preamble state, both of those are about a name.
 
-the gates are the kprobe ones for a kretprobe too, register_kretprobe
-registers a kprobe, and a kretprobe needs the function entry on top of
-them, which register_kretprobe enforces itself and this report cannot
-see. HK_KPROBE_OK is not a promise, an install can still fail on a
-kernel symbol the resolver cannot reach or on a tracking node that
-cannot be allocated.
+the report is about the address gates only: it does not judge a landing
+pad, the frame, or whether a handler may return early. that is the adjust
+the caller names, and hk_kprobe_adjust_pad answers the pad part when it
+is called directly. the gates are the kprobe ones for a kretprobe too,
+register_kretprobe registers a kprobe, and a kretprobe needs the function
+entry on top of them, which register_kretprobe enforces itself and this
+report cannot see. HK_KPROBE_OK is not a promise, an install can still
+fail on a kernel symbol the resolver cannot reach or on a tracking node
+that cannot be allocated.
 
 **handler helpers**
 
@@ -567,8 +570,14 @@ arm64 carries the first eight arguments of a call in x0 to x7 and the
 return value in x0. hk_regs_arg and hk_regs_set_arg read and write an
 argument at an entry, hk_regs_ret and hk_regs_set_ret read and write
 the return value where a kretprobe handler runs, hk_regs_ip returns the
-pc, hk_regs_lr returns the link register, and hk_regs_skip steps the pc
-over the probed instruction for a pre handler that returns 1.
+pc, hk_regs_lr returns the link register, and hk_regs_skip(p, regs)
+steps the pc over the probed instruction for a pre handler that returns
+1. it reads p->opcode, not the word at regs->pc, which is the brk, and
+refuses a landing pad or a frame word with -EOPNOTSUPP and the pc
+unchanged: the frame words are the stp or str to sp, the sub or add of
+sp, and the mov between x29 and sp, which hk_insn_is_frame answers. 0
+when the pc moved, -EINVAL on a NULL probe, and a handler that gets a
+negative return must not return 1 without moving the pc itself.
 
 the replacement idiom for a hot target is hk_regs_return, it parks the
 pc on the link register so the target returns at once with x0 as the
