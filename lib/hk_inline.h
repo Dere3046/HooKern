@@ -24,6 +24,21 @@ struct hk_inline_guard {
 	bool active;
 };
 
+/* the decide stub saves the target registers in this order */
+struct hk_inline_regs {
+	unsigned long x[8];
+	unsigned long x8;
+	unsigned long lr;
+	unsigned long sp;
+};
+
+/* the entry stub reads tramp, arg and decide from this context */
+struct hk_inline_ctx {
+	unsigned long tramp;
+	void *arg;
+	int (*decide)(struct hk_inline_regs *regs, void *arg);
+};
+
 struct hk_inline {
 	const char *name;
 	unsigned long addr;
@@ -37,6 +52,7 @@ struct hk_inline {
 	struct hk_inline_guard guard[HK_INLINE_GUARD_MAX];
 	u32 guard_count;
 	u8 saved[HK_INLINE_ENTRY_MAX * 4];
+	struct hk_inline_ctx ctx;
 };
 
 /*
@@ -59,6 +75,23 @@ struct hk_inline {
  */
 int hk_inline_hook(struct hk_inline *h, const char *sym,
 		   const char *wrapper_sym);
+
+/*
+ * the ops form picks the entry shape: a wrapper symbol, a stub symbol the
+ * resolver maps, or the built in decide stub. the decide callback runs with
+ * the target sp and lr, so a paciasp or pacibsp prologue authenticates its own
+ * frame. returning 0 jumps to the trampoline, returning 1 returns regs->x[0]
+ * to the caller. exactly one of wrapper_sym, stub_sym and decide is used.
+ */
+struct hk_inline_ops {
+	const char *sym;
+	const char *wrapper_sym;
+	const char *stub_sym;
+	int (*decide)(struct hk_inline_regs *regs, void *arg);
+	void *arg;
+};
+
+int hk_inline_hook_ops(struct hk_inline *h, const struct hk_inline_ops *ops);
 /* restore the entry, -EIO when the write fails and the hook stays live. the
  * window is released with the restore, a later install may take it */
 int hk_inline_disable(struct hk_inline *h);

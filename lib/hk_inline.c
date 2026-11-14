@@ -26,6 +26,14 @@
 #define HK_TRAMP_SIZE 4096
 #define HK_INS_LDR_X17 0x58000051
 #define HK_INS_LDR_X17_P12 0x58000071
+#define HK_INS_LDR_X16_P12 0x58000090
+#define HK_INS_BR_X16 0xD61F0200
+#define HK_INLINE_CTX_WORDS 9
+#define HK_INLINE_CTX_BYTES (HK_INLINE_CTX_WORDS * 4)
+#define HK_INLINE_CTX_ORIG (HK_INLINE_CTX_BYTES - 4)
+#define HK_INLINE_WRAP_WORDS 6
+#define HK_INLINE_WRAP_BYTES (HK_INLINE_WRAP_WORDS * 4)
+#define HK_INLINE_WRAP_ORIG (HK_INLINE_WRAP_BYTES - 4)
 #define HK_INS_B_X12 0x14000003
 #define HK_INS_BR_X17 0xD61F0220
 #define HK_INS_RET_X17 0xD65F0220
@@ -845,25 +853,28 @@ static void hk_bti_guard_restore(struct hk_inline *h)
 }
 
 static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
-				   const char *wrapper_sym, unsigned long addr)
+				   unsigned long target, unsigned long addr,
+				   bool detect_pac,
+				   const struct hk_inline_ctx *in)
 {
 	struct hk_relo_ctx ctx;
 	u32 *tramp;
 	u32 detour[HK_INLINE_ENTRY_MAX];
-	unsigned long wrapper;
 	unsigned long mem;
 	u32 saved[HK_INLINE_ENTRY_MAX];
 	u32 i;
 	int ret;
 
 	memset(h, 0, sizeof(*h));
+	if (in)
+		h->ctx = *in;
 	tramp = kzalloc(256, GFP_KERNEL);
 	if (!tramp)
 		return -ENOMEM;
 
-	wrapper = hk_resolve(wrapper_sym);
-	if (!wrapper || !hk_ker_addr_ok(wrapper)) {
-		pr_warn("[lkmhook] inline resolve %s failed\n", wrapper_sym);
+	if (!target || !hk_ker_addr_ok(target)) {
+		pr_warn("[lkmhook] inline target 0x%lx is not a kernel address\n",
+			target);
 		ret = -ENODATA;
 		goto err_free;
 	}
@@ -894,6 +905,25 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 		goto err_free;
 	}
 
+	/*
+	 * a body that signs its own return address cannot go through a c
+	 * wrapper. the trampoline would run paciasp or pacibsp with the wrapper
+	 * sp and lr, and the later autiasp would authenticate a frame the
+	 * wrapper never made.
+	 */
+	if (detect_pac) {
+		for (i = 0; i < HK_INLINE_ENTRY_MAX; i++) {
+			if (saved[i] == 0xD503233F || saved[i] == 0xD503237F)
+				break;
+		}
+		if (i < HK_INLINE_ENTRY_MAX) {
+			pr_warn("[lkmhook] inline %s has a pac prologue, refusing the c wrapper form\n",
+				sym);
+			ret = -EOPNOTSUPP;
+			goto err_free;
+		}
+	}
+
 	mem = (unsigned long)hk_exec_alloc(HK_TRAMP_SIZE);
 	if (!mem) {
 		pr_warn("[lkmhook] inline exec alloc %s failed\n", sym);
@@ -906,19 +936,32 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	h->window = HK_INLINE_PATCH_LEN;
 	h->name = sym;
 
-	tramp[0] = HK_INS_BTI_JC;
-	tramp[1] = HK_INS_LDR_X17;
-	tramp[2] = HK_INS_RET_X17;
-	tramp[3] = wrapper & 0xFFFFFFFF;
-	tramp[4] = wrapper >> 32;
-	tramp[5] = HK_INS_BTI_JC;
+	if (in) {
+		tramp[0] = HK_INS_BTI_JC;
+		tramp[1] = HK_INS_LDR_X17_P12;
+		tramp[2] = HK_INS_LDR_X16_P12;
+		tramp[3] = HK_INS_BR_X16;
+		tramp[4] = (unsigned long)&h->ctx & 0xFFFFFFFF;
+		tramp[5] = (unsigned long)&h->ctx >> 32;
+		tramp[6] = target & 0xFFFFFFFF;
+		tramp[7] = target >> 32;
+		tramp[8] = HK_INS_BTI_JC;
+	} else {
+		tramp[0] = HK_INS_BTI_JC;
+		tramp[1] = HK_INS_LDR_X17;
+		tramp[2] = HK_INS_RET_X17;
+		tramp[3] = target & 0xFFFFFFFF;
+		tramp[4] = target >> 32;
+		tramp[5] = HK_INS_BTI_JC;
+	}
 
 	memset(&ctx, 0, sizeof(ctx));
-	ctx.dst = tramp + 6;
+	ctx.dst = tramp + (in ? HK_INLINE_CTX_WORDS : HK_INLINE_WRAP_WORDS);
 	ctx.src = h->saved;
 	ctx.tramp_start = addr;
 	ctx.tramp_end = addr + HK_INLINE_PATCH_LEN;
-	ctx.backup_start = mem + 24;
+	ctx.backup_start = mem + (in ? HK_INLINE_CTX_BYTES :
+				   HK_INLINE_WRAP_BYTES);
 
 	for (i = 0; i < HK_INLINE_ENTRY_MAX; i++) {
 		ctx.inst_addr = addr + i * 4;
@@ -944,11 +987,19 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	if (ret)
 		goto err_guard;
 
-	ret = hk_engine_write((void *)mem, tramp, ctx.count * 4 + 24);
+	ret = hk_engine_write((void *)mem, tramp,
+			      ctx.count * 4 +
+			      (in ? HK_INLINE_CTX_BYTES : HK_INLINE_WRAP_BYTES));
 	if (ret)
 		goto err_guard;
 
-	h->orig = mem + 20;
+	h->orig = mem + (in ? HK_INLINE_CTX_ORIG : HK_INLINE_WRAP_ORIG);
+
+	/* the stub can run the instant the detour lands */
+	if (in) {
+		h->ctx.tramp = h->orig;
+		smp_wmb();
+	}
 
 	/*
 	 * the detour is written in one call, so a multi instruction window goes
@@ -981,34 +1032,75 @@ err_free:
 	return ret;
 }
 
-__nocfi int hk_inline_hook(struct hk_inline *h, const char *sym,
-			   const char *wrapper_sym)
+extern char hk_inline_decide_stub[];
+
+__nocfi int hk_inline_hook_ops(struct hk_inline *h,
+			       const struct hk_inline_ops *ops)
 {
+	struct hk_inline_ctx in = { };
+	const char *wrapper_sym;
+	const char *stub_sym;
 	unsigned long addr = 0;
+	unsigned long target;
+	int forms;
 	int ret;
 
-	if (!h || !sym || !wrapper_sym)
+	if (!h || !ops || !ops->sym)
+		return -EINVAL;
+	wrapper_sym = ops->wrapper_sym;
+	stub_sym = ops->stub_sym;
+	forms = !!wrapper_sym + !!stub_sym + !!ops->decide;
+	if (forms != 1)
 		return -EINVAL;
 
-	/*
-	 * one lock across trampoline allocation, relocation and both text
-	 * writes, so two installs cannot interleave their trampolines or their
-	 * entry windows, and no trampoline is freed under a reader
-	 */
-	ret = hk_read_addr(sym, &addr);
+	if (wrapper_sym) {
+		target = hk_resolve(wrapper_sym);
+		if (!target || !hk_ker_addr_ok(target)) {
+			pr_warn("[lkmhook] inline resolve %s failed\n",
+				wrapper_sym);
+			return -ENODATA;
+		}
+	} else if (stub_sym) {
+		target = hk_resolve(stub_sym);
+		if (!target || !hk_ker_addr_ok(target)) {
+			pr_warn("[lkmhook] inline resolve %s failed\n",
+				stub_sym);
+			return -ENODATA;
+		}
+		in.arg = ops->arg;
+	} else {
+		target = (unsigned long)hk_inline_decide_stub;
+		in.decide = ops->decide;
+		in.arg = ops->arg;
+	}
+
+	ret = hk_read_addr(ops->sym, &addr);
 	if (ret) {
-		pr_warn("[lkmhook] inline resolve %s failed %d\n", sym, ret);
+		pr_warn("[lkmhook] inline resolve %s failed %d\n", ops->sym,
+			ret);
 		return -ENODATA;
 	}
-	ret = hk_inline_own(h, sym, addr, HK_INLINE_PATCH_LEN);
+	ret = hk_inline_own(h, ops->sym, addr, HK_INLINE_PATCH_LEN);
 	if (ret)
 		return ret;
 	mutex_lock(&g_inline_lock);
-	ret = hk_inline_apply(h, sym, wrapper_sym, addr);
+	ret = hk_inline_apply(h, ops->sym, target, addr, wrapper_sym != NULL,
+			      wrapper_sym ? NULL : &in);
 	mutex_unlock(&g_inline_lock);
 	if (ret)
 		hk_inline_release(h);
 	return ret;
+}
+
+__nocfi int hk_inline_hook(struct hk_inline *h, const char *sym,
+			   const char *wrapper_sym)
+{
+	struct hk_inline_ops ops = {
+		.sym = sym,
+		.wrapper_sym = wrapper_sym,
+	};
+
+	return hk_inline_hook_ops(h, &ops);
 }
 
 int hk_inline_disable(struct hk_inline *h)

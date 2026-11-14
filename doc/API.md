@@ -292,6 +292,28 @@ window overlaps one is refused with -EBUSY, the log line names both
 symbols, nothing is written. hk_inline_probe answers the same condition
 before an install is attempted.
 
+a target whose entry is paciasp or pacibsp is refused with
+-EOPNOTSUPP. the c wrapper would run the trampoline with the wrapper
+frame and the target autiasp would authenticate a frame the wrapper
+never made.
+
+**int hk_inline_hook_ops(struct hk_inline *h,
+const struct hk_inline_ops *ops)**
+
+the ops form picks one entry shape. wrapper_sym is the c wrapper,
+stub_sym is a caller stub the resolver maps, decide is the built in
+preset stub. exactly one of them is set. the stub and the preset run
+with the target sp and lr, so a paciasp or pacibsp prologue
+authenticates its own frame; hk_inline_hook refuses such an entry
+because a c wrapper would sign the wrapper frame.
+
+the decide callback gets the entry registers and ops->arg. returning
+0 jumps to the trampoline, returning 1 returns regs->x[0] to the
+caller. the stub form reads its trampoline and arg from the context
+the library passes in x17, and the preset decide stub is library asm,
+so a consumer only supplies the callback. hk_inline_hook is the
+wrapper_sym shorthand of the same path.
+
 installs are serialized by a mutex held across trampoline allocation,
 relocation and the text writes, so two hooks cannot interleave and a
 restore cannot run inside an install. the write itself is still not

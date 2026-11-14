@@ -9,7 +9,7 @@
 #   patch           lib/hk_patch.o lib/hk_flush.o
 #   kprobe          lib/hk_kprobe.o
 #   kretprobe       lib/hk_kretprobe.o
-#   inline          lib/hk_inline.o and patch
+#   inline          lib/hk_inline.o lib/hk_inline_stub.o and patch
 #   ptr             lib/hk_ptr.o and patch
 #   cfi             lib/hk_cfi.o and patch
 #   lsm             lib/hk_lsm.o and patch
@@ -29,6 +29,9 @@
 # -DHK_NO_INLINE -DHK_NO_PTR -DHK_NO_SIGHOOK, which measured 19 percent smaller
 # than the same consumer with the whole library in it.
 DEPS_LIB_NAME := HooKern
-DEPS_LIB_OBJS := lib/hk.o lib/hk_ksym.o lib/hk_patch.o lib/hk_flush.o lib/hk_ptr.o lib/hk_inline.o lib/hk_kprobe.o lib/hk_redir.o lib/hk_kretprobe.o lib/hk_sighook.o lib/hk_cfi.o lib/hk_binder.o lib/hk_lsm.o
+DEPS_LIB_OBJS := lib/hk.o lib/hk_ksym.o lib/hk_patch.o lib/hk_flush.o \
+	lib/hk_ptr.o lib/hk_inline.o lib/hk_inline_stub.o \
+	lib/hk_kprobe.o lib/hk_redir.o lib/hk_kretprobe.o \
+	lib/hk_sighook.o lib/hk_cfi.o lib/hk_binder.o lib/hk_lsm.o
 DEPS_LIB_INCS := lib
 DEPS_LIB_DEPS := KallRecon
