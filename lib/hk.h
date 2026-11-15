@@ -10,6 +10,7 @@
 
 struct hk_cfg {
 	unsigned long (*resolve)(const char *name);
+	unsigned long (*resolve_next)(unsigned long addr);
 	/*
 	 * how the library writes text when a caller does not name a path itself,
 	 * one of the hk_write_* primitives of hk_patch.h. NULL takes the kernel's
@@ -74,6 +75,7 @@ int hk_kprobe_adjust_pad(unsigned long addr, void *arg, unsigned long *out);
 int hk_init(const struct hk_cfg *cfg);
 void hk_exit(void);
 unsigned long hk_resolve(const char *name);
+unsigned long hk_resolve_next(unsigned long addr);
 
 /*
  * the consumers run their own exit, the library only counts the failures it was
@@ -113,4 +115,7 @@ void hk_notice(enum hk_notice what, const char *detail);
  * consumer needs nothing
  */
 void hk_wait_tasks_rcu(void);
+
+#include "hk_xref.h"
+
 #endif

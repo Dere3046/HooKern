@@ -7,5 +7,6 @@
 #define LKMHOOK_HK_CFI_H
 
 int hk_cfi_bypass(void);
+void hk_cfi_exit(void);
 
 #endif

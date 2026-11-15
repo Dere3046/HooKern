@@ -37,6 +37,7 @@ object, and a group the consumer leaves out is left out of the link entirely:
 | sighook | hk_sighook | HK_NO_SIGHOOK | kprobe |
 | binder | hk_binder | none | inline |
 | redir | hk_redir | HK_NO_REDIR | kprobe, kretprobe, and inline with patch for the text route |
+| xref | hk_xref | none | core |
 
 the flag is what keeps the core linkable without the group: it turns the calls the
 core makes into that group into nothing, so `hk_exit` and `hk_exit_block` still
@@ -921,4 +922,84 @@ with a Type_info layout every offset comes from layout->member_off at
 runtime. without one the head is found by scanning the heads for the one
 that carries the target and the caller sets hook_offset itself, which is
 the state a kernel without a type source runs in.
+
+## Call site probe (xref)
+
+call site probe and inlining detection for ARM64 kernel text. scans caller
+instruction streams through `copy_from_kernel_nofault` without modifying code,
+identifies direct calls (`BL`) and tail calls (`B`), resolves compiler jump
+stubs / CFI veneers, and reports call states.
+
+```c
+#include "hk_xref.h"
+
+enum hk_call_state {
+	HK_CALL_STATE_UNKNOWN        = 0,
+	HK_CALL_STATE_NO_DIRECT_CALL = 1,
+	HK_CALL_STATE_LIVE           = 2,
+	HK_CALL_STATE_TAIL           = 3,
+	HK_CALL_STATE_NOT_FOUND      = 4,
+	HK_CALL_STATE_ERROR          = 5,
+};
+
+#define HK_CALL_STATE_INLINED HK_CALL_STATE_NO_DIRECT_CALL
+
+#define HK_SITE_MAX_OFFSETS	8
+#define HK_DEFAULT_MAX_INSNS	4096
+#define HK_HARD_MAX_INSNS	65536
+
+#define HK_DEFAULT_BRANCH_HOPS	4
+#define HK_MAX_BRANCH_HOPS	16
+
+#define HK_SITE_F_TRUNCATED	0x01
+#define HK_SITE_F_FAULT		0x02
+
+struct hk_call_site {
+	const char     *caller_name;
+	const char     *callee_name;
+	unsigned long   caller_addr;
+	unsigned long   callee_addr;
+	unsigned long   caller_end;
+	size_t          caller_size;
+	size_t          max_insns;
+	unsigned int    max_hops;
+	unsigned int    bl_count;
+	unsigned int    b_count;
+	size_t          scanned_insns;
+	enum hk_call_state state;
+	u32             flags;
+	u32             offsets[HK_SITE_MAX_OFFSETS];
+	u32             offset_count;
+};
+```
+
+**int hk_probe_call_site(struct hk_call_site *site)**
+
+probes a single caller and callee relationship. when caller_addr or callee_addr
+is 0, resolves through caller_name or callee_name. explicit bounds use caller_size
+or caller_end, both requiring 4-byte alignment. without explicit bounds, probes
+the next symbol through hk_resolve_next, or stops at an unbranched RET followed
+by a prologue. max_hops sets unwrap depth (0 for default 4, up to 16). returns 0
+on success, -EINVAL on bad arguments, -ENOENT on unresolvable symbol, and -EFAULT
+on unreadable memory.
+
+**int hk_probe_call_sites(struct hk_call_site *sites, size_t count)**
+
+batch probe an array of call sites. returns the count of failed probes, or
+-EINVAL when sites is NULL.
+
+**unsigned long hk_unwrap_trampoline(unsigned long addr)**
+
+unwraps jump stubs, BTI landing pads and literal veneers using default 4 hops.
+includes stack cycle detection.
+
+**unsigned long hk_unwrap_trampoline_depth(unsigned long addr, unsigned int max_hops)**
+
+unwraps jump stubs with custom maximum depth (0 for default 4, capped at 16).
+includes stack cycle detection.
+
+**bool hk_is_inlined(const struct hk_call_site *site)**
+
+true when site state is HK_CALL_STATE_NO_DIRECT_CALL.
+
 

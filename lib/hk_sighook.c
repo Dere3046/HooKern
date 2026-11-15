@@ -38,6 +38,7 @@ int hk_sighook_add(unsigned long start, unsigned long end, hk_sighook_fn fn,
 {
 	struct hk_sighook_entry *new;
 	struct hk_sighook_entry *ent;
+	unsigned long flags;
 
 	if (!fn || end <= start)
 		return -EINVAL;
@@ -48,12 +49,12 @@ int hk_sighook_add(unsigned long start, unsigned long end, hk_sighook_fn fn,
 	if (!new)
 		return -ENOMEM;
 
-	spin_lock(&g_sighook_lock);
+	spin_lock_irqsave(&g_sighook_lock, flags);
 	list_for_each_entry(ent, &g_sighook, list) {
 		if (start < ent->end && ent->start < end) {
 			unsigned long other = ent->start;
 
-			spin_unlock(&g_sighook_lock);
+			spin_unlock_irqrestore(&g_sighook_lock, flags);
 			kfree(new);
 			pr_warn("[lkmhook] sighook range 0x%lx conflicts with 0x%lx\n",
 				start, other);
@@ -65,7 +66,7 @@ int hk_sighook_add(unsigned long start, unsigned long end, hk_sighook_fn fn,
 	new->fn = fn;
 	new->priv = priv;
 	list_add(&new->list, &g_sighook);
-	spin_unlock(&g_sighook_lock);
+	spin_unlock_irqrestore(&g_sighook_lock, flags);
 	return 0;
 }
 
@@ -73,21 +74,27 @@ void hk_sighook_del(hk_sighook_fn fn)
 {
 	struct hk_sighook_entry *ent;
 	struct hk_sighook_entry *tmp;
+	unsigned long flags;
 
 	if (!fn)
 		return;
 
-	spin_lock(&g_sighook_lock);
+	spin_lock_irqsave(&g_sighook_lock, flags);
 	list_for_each_entry_safe(ent, tmp, &g_sighook, list) {
 		if (ent->fn != fn)
 			continue;
 		list_del(&ent->list);
-		spin_unlock(&g_sighook_lock);
+		spin_unlock_irqrestore(&g_sighook_lock, flags);
 		kfree(ent);
 		return;
 	}
-	spin_unlock(&g_sighook_lock);
+	spin_unlock_irqrestore(&g_sighook_lock, flags);
 }
+
+struct hk_sighook_target {
+	hk_sighook_fn fn;
+	void *priv;
+};
 
 /*
  * the interrupted register file of the delivery, which is argument four of
@@ -97,9 +104,10 @@ void hk_sighook_del(hk_sighook_fn fn)
  */
 static int hk_sighook_pre(struct kprobe *p, struct pt_regs *regs)
 {
-	struct hk_sighook_entry *fire[HK_SIGHOOK_FIRE_MAX];
+	struct hk_sighook_target fire[HK_SIGHOOK_FIRE_MAX];
 	struct hk_sighook_entry *ent;
 	struct pt_regs *user;
+	unsigned long flags;
 	unsigned long pc;
 	unsigned int count = 0;
 	unsigned int i;
@@ -117,7 +125,7 @@ static int hk_sighook_pre(struct kprobe *p, struct pt_regs *regs)
 	 * it is dropped: a consumer may take its own lock and has to be able to
 	 * unregister itself, and the interval table is a short list
 	 */
-	spin_lock(&g_sighook_lock);
+	spin_lock_irqsave(&g_sighook_lock, flags);
 	list_for_each_entry(ent, &g_sighook, list) {
 		if (pc < ent->start || pc >= ent->end)
 			continue;
@@ -126,9 +134,11 @@ static int hk_sighook_pre(struct kprobe *p, struct pt_regs *regs)
 				     HK_SIGHOOK_FIRE_MAX);
 			break;
 		}
-		fire[count++] = ent;
+		fire[count].fn = ent->fn;
+		fire[count].priv = ent->priv;
+		count++;
 	}
-	spin_unlock(&g_sighook_lock);
+	spin_unlock_irqrestore(&g_sighook_lock, flags);
 
 	for (i = 0; i < count; i++) {
 		struct hk_sighook_context ctx;
@@ -136,8 +146,8 @@ static int hk_sighook_pre(struct kprobe *p, struct pt_regs *regs)
 		ctx.signal = signal;
 		ctx.pc = pc;
 		ctx.regs = user;
-		ctx.priv = fire[i]->priv;
-		fire[i]->fn(&ctx);
+		ctx.priv = fire[i].priv;
+		fire[i].fn(&ctx);
 	}
 	return 0;
 }
@@ -194,15 +204,16 @@ void hk_sighook_exit(void)
 {
 	struct hk_sighook_entry *ent;
 	struct hk_sighook_entry *tmp;
+	unsigned long flags;
 
 	if (g_sighook_armed) {
 		hk_kprobe_remove(&g_sighook_rt);
 		g_sighook_armed = false;
 	}
-	spin_lock(&g_sighook_lock);
+	spin_lock_irqsave(&g_sighook_lock, flags);
 	list_for_each_entry_safe(ent, tmp, &g_sighook, list) {
 		list_del(&ent->list);
 		kfree(ent);
 	}
-	spin_unlock(&g_sighook_lock);
+	spin_unlock_irqrestore(&g_sighook_lock, flags);
 }

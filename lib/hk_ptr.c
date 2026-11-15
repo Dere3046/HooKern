@@ -16,6 +16,7 @@ struct hk_ptr_entry {
 	struct list_head list;
 	void **slot;
 	void *orig;
+	bool unhooking;
 };
 
 static LIST_HEAD(g_ptrs);
@@ -44,7 +45,7 @@ int hk_ptr_hook(void **slot, void *replacement, void **orig_out)
 	void *orig;
 	int ret;
 
-	if (!slot || !replacement)
+	if (!slot || ((unsigned long)slot & 7) || !replacement)
 		return -EINVAL;
 
 	new = kzalloc(sizeof(*new), GFP_KERNEL);
@@ -63,7 +64,7 @@ int hk_ptr_hook(void **slot, void *replacement, void **orig_out)
 			continue;
 		spin_unlock_irqrestore(&g_ptr_lock, flags);
 		kfree(new);
-		return -EEXIST;
+		return ent->unhooking ? -EBUSY : -EEXIST;
 	}
 	list_for_each_entry(ent, &g_ptr_broken, list) {
 		if (ent->slot != slot)
@@ -79,6 +80,7 @@ int hk_ptr_hook(void **slot, void *replacement, void **orig_out)
 	}
 	new->slot = slot;
 	new->orig = orig;
+	new->unhooking = false;
 	list_add(&new->list, &g_ptrs);
 	spin_unlock_irqrestore(&g_ptr_lock, flags);
 
@@ -112,25 +114,27 @@ int hk_ptr_hook(void **slot, void *replacement, void **orig_out)
 void hk_ptr_unhook(void **slot)
 {
 	struct hk_ptr_entry *ent;
-	struct hk_ptr_entry *tmp;
 	struct hk_ptr_entry *found = NULL;
 	unsigned long flags;
 	int ret;
 
-	if (!slot)
+	if (!slot || ((unsigned long)slot & 7))
 		return;
 
 	/*
-	 * the entry leaves the live list before the write, so a hook installed
-	 * while the restore sleeps takes the slot, reads the replacement as its
-	 * own original and is correct. a restore that fails is kept for the exit
-	 * gate instead of being dropped, the slot still points at module memory
+	 * the entry is marked unhooking under the lock so a concurrent hook
+	 * sees the slot is in transition and refuses it with -EBUSY. the entry
+	 * stays on the live list until the restore write completes
 	 */
 	spin_lock_irqsave(&g_ptr_lock, flags);
-	list_for_each_entry_safe(ent, tmp, &g_ptrs, list) {
+	list_for_each_entry(ent, &g_ptrs, list) {
 		if (ent->slot != slot)
 			continue;
-		list_del(&ent->list);
+		if (ent->unhooking) {
+			spin_unlock_irqrestore(&g_ptr_lock, flags);
+			return;
+		}
+		ent->unhooking = true;
 		found = ent;
 		break;
 	}
@@ -139,13 +143,15 @@ void hk_ptr_unhook(void **slot)
 	if (!found)
 		return;
 	ret = hk_patch_write(slot, (unsigned long)found->orig);
+	spin_lock_irqsave(&g_ptr_lock, flags);
+	list_del(&found->list);
 	if (ret) {
 		pr_warn("[lkmhook] ptr unhook %px failed %d\n", slot, ret);
-		spin_lock_irqsave(&g_ptr_lock, flags);
 		list_add(&found->list, &g_ptr_broken);
 		spin_unlock_irqrestore(&g_ptr_lock, flags);
 		return;
 	}
+	spin_unlock_irqrestore(&g_ptr_lock, flags);
 	kfree(found);
 }
 

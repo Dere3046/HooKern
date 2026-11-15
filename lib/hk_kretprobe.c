@@ -137,6 +137,9 @@ static int hk_kretprobe_add(struct hk_kretprobe *h)
 	if (!node)
 		return -ENOMEM;
 
+	if (!h->rp.maxactive)
+		h->rp.maxactive = max_t(unsigned int, 64, num_possible_cpus() * 16);
+
 	ret = call_register_kretprobe(&h->rp);
 	if (ret < 0) {
 		kfree(node);
@@ -254,13 +257,25 @@ void hk_kretprobe_exit(void)
 
 	list_for_each_entry_safe(node, tmp, &pending, list) {
 		if (hk_kretprobe_drop(node->hook))
-			g_kretprobe_stuck++;
+			continue;
 		list_del(&node->list);
 		kfree(node);
 	}
+
+	spin_lock_irqsave(&g_kretprobe_lock, flags);
+	list_splice_tail(&pending, &g_kretprobes);
+	spin_unlock_irqrestore(&g_kretprobe_lock, flags);
 }
 
 unsigned int hk_kretprobe_pending(void)
 {
-	return READ_ONCE(g_kretprobe_stuck);
+	unsigned int count = 0;
+	struct hk_kretprobe_node *node;
+	unsigned long flags;
+
+	spin_lock_irqsave(&g_kretprobe_lock, flags);
+	list_for_each_entry(node, &g_kretprobes, list)
+		count++;
+	spin_unlock_irqrestore(&g_kretprobe_lock, flags);
+	return count;
 }

@@ -1161,13 +1161,23 @@ bool hk_patch_kernel_primitive_ok(unsigned long addr)
 
 	/*
 	 * the kernel translates its own text arithmetically and never through
-	 * vmalloc_to_page, so text is safe whatever the mapping looks like
+	 * vmalloc_to_page, so core text is safe whatever the mapping looks like
 	 */
 	if (hk_core_text(addr))
 		return true;
-	if (hk_walk_pa(addr, &phys, NULL, &level))
-		return true;
-	return level == HK_WALK_PTE;
+	/*
+	 * non text kernel image addresses (rodata, data, ro_after_init) are not
+	 * core text and not vmalloc. the kernel patch_map would call vmalloc_to_page
+	 * on them, returning NULL and triggering BUG_ON(!page). route to fixmap
+	 */
+	if (hk_kernel_image_addr(addr))
+		return false;
+	if (is_vmalloc_addr((const void *)addr)) {
+		if (hk_walk_pa(addr, &phys, NULL, &level))
+			return true;
+		return level == HK_WALK_PTE;
+	}
+	return false;
 }
 
 /*

@@ -205,30 +205,78 @@ static __nocfi int hk_fetch_insn(unsigned long addr, u32 *out)
  * reads through the nofault helper, a chain that cannot be read stops the walk
  * and every hook that lands on an unreadable target is refused later
  */
-static __nocfi int hk_resolve_branch_chain(unsigned long addr,
-					   unsigned long *out)
+#define HK_INLINE_DEFAULT_HOPS	4
+#define HK_INLINE_MAX_HOPS	16
+
+static __nocfi int hk_resolve_branch_chain_depth(unsigned long addr,
+						 unsigned long *out,
+						 unsigned int max_hops)
 {
+	unsigned long visited[HK_INLINE_MAX_HOPS];
+	unsigned long next_addr;
 	u32 insn;
 	u32 next;
 	int depth;
+	int i;
 
-	for (depth = 0; depth < 32; depth++) {
-		if (hk_fetch_insn(addr, &insn))
+	if (!addr || !hk_ker_addr_ok(addr) || (addr & 3))
+		return -EINVAL;
+
+	if (!max_hops)
+		max_hops = HK_INLINE_DEFAULT_HOPS;
+	if (max_hops > HK_INLINE_MAX_HOPS)
+		max_hops = HK_INLINE_MAX_HOPS;
+
+	for (depth = 0; depth < max_hops; depth++) {
+		visited[depth] = addr;
+
+		if (hk_fetch_insn(addr, &insn)) {
 			return -EFAULT;
+		}
 		if (hk_is_b(insn)) {
-			addr = hk_decode_b_target(insn, addr);
+			next_addr = hk_decode_b_target(insn, addr);
+			if (next_addr == addr || !hk_ker_addr_ok(next_addr) ||
+			    (next_addr & 3)) {
+				break;
+			}
+			for (i = 0; i <= depth; i++) {
+				if (visited[i] == next_addr) {
+					goto done;
+				}
+			}
+			addr = next_addr;
 			continue;
 		}
-		if (!hk_is_hint(insn))
+		if (!hk_is_hint(insn)) {
 			break;
-		if (hk_fetch_insn(addr + 4, &next))
+		}
+		if (hk_fetch_insn(addr + 4, &next)) {
 			return -EFAULT;
-		if (!hk_is_b(next))
+		}
+		if (!hk_is_b(next)) {
 			break;
-		addr = hk_decode_b_target(next, addr + 4);
+		}
+		next_addr = hk_decode_b_target(next, addr + 4);
+		if (next_addr == addr || !hk_ker_addr_ok(next_addr) ||
+		    (next_addr & 3)) {
+			break;
+		}
+		for (i = 0; i <= depth; i++) {
+			if (visited[i] == next_addr) {
+				goto done;
+			}
+		}
+		addr = next_addr;
 	}
+done:
 	*out = addr;
 	return 0;
+}
+
+static __nocfi int hk_resolve_branch_chain(unsigned long addr,
+					   unsigned long *out)
+{
+	return hk_resolve_branch_chain_depth(addr, out, HK_INLINE_DEFAULT_HOPS);
 }
 
 struct hk_relo_ctx {
@@ -1151,8 +1199,10 @@ void hk_inline_free(struct hk_inline *h)
 		return;
 	}
 	hk_bti_guard_restore(h);
-	if (h->mem)
+	if (h->mem) {
+		hk_wait_tasks_rcu();
 		hk_exec_free(h->mem);
+	}
 	h->addr = 0;
 	h->orig = 0;
 	h->mem = NULL;
@@ -1233,9 +1283,12 @@ unsigned int hk_inline_pending(void)
 {
 	unsigned int count = 0;
 	struct hk_inline_pending *ent;
+	struct hk_inline_own *own;
 
 	mutex_lock(&g_inline_lock);
 	list_for_each_entry(ent, &g_inline_pending, list)
+		count++;
+	list_for_each_entry(own, &g_inline_owned, list)
 		count++;
 	mutex_unlock(&g_inline_lock);
 	return count;
@@ -1243,9 +1296,23 @@ unsigned int hk_inline_pending(void)
 
 void hk_inline_exit(void)
 {
+	struct hk_inline_own *own;
+	struct hk_inline_own *own_tmp;
 	struct hk_inline_pending *ent;
 	struct hk_inline_pending *tmp;
+	LIST_HEAD(active);
 	LIST_HEAD(work);
+
+	mutex_lock(&g_inline_lock);
+	list_splice_init(&g_inline_owned, &active);
+	mutex_unlock(&g_inline_lock);
+
+	list_for_each_entry_safe(own, own_tmp, &active, list) {
+		list_del(&own->list);
+		if (own->hook)
+			hk_inline_unhook(own->hook);
+		kfree(own);
+	}
 
 	mutex_lock(&g_inline_lock);
 	list_splice_init(&g_inline_pending, &work);

@@ -3,7 +3,7 @@ obj-m := lkmhook.o
 lkmhook-y := src/main.o lib/hk.o lib/hk_ksym.o lib/hk_patch.o lib/hk_flush.o lib/hk_ptr.o \
 	lib/hk_inline.o lib/hk_inline_stub.o lib/hk_kprobe.o lib/hk_redir.o lib/hk_kretprobe.o \
 	lib/hk_sighook.o \
-	lib/hk_cfi.o lib/hk_binder.o \
+	lib/hk_cfi.o lib/hk_binder.o lib/hk_xref.o \
 	deps/KallRecon/lib/core.o deps/KallRecon/lib/slide.o deps/KallRecon/lib/anchor.o
 
 ifeq ($(HK_LSM),1)

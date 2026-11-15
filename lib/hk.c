@@ -96,6 +96,22 @@ __nocfi noinline unsigned long hk_resolve(const char *name)
 	return 0;
 }
 
+__nocfi noinline unsigned long hk_resolve_next(unsigned long addr)
+{
+	unsigned long next;
+
+	if (!addr) {
+		return 0;
+	}
+	if (g_cfg.resolve_next && !g_exiting) {
+		next = g_cfg.resolve_next(addr);
+		if (next && hk_ker_addr_ok(next) && next > addr) {
+			return next;
+		}
+	}
+	return 0;
+}
+
 /* a compiler writes at most a bti and a pac prologue, so four words cover every
  * entry; an entry whose first four words are all pads has no body behind them */
 #define HK_PAD_MAX 4
@@ -245,6 +261,7 @@ void hk_exit_block(void)
 		ssleep(60);
 		hk_inline_exit();
 		hk_ptr_exit();
+		hk_kprobe_exit();
 		hk_kretprobe_exit();
 	}
 	pr_info("[lkmhook] exit clean\n");

@@ -165,7 +165,20 @@ void __nocfi hk_binder_transaction_wrap(void *proc, void *thread,
 			if (tr->data_size && tr->data.ptr.buffer) {
 				len = min_t(size_t, tr->data_size,
 					    HK_BINDER_MAX_PAYLOAD);
-				if (copy_from_user(ev.payload,
+				if (in_atomic() || irqs_disabled()) {
+					if (copy_from_kernel_nofault(ev.payload,
+								     (const void *)(uintptr_t)tr->data.ptr.buffer,
+								     len)) {
+						memset(ev.payload, 0,
+						       sizeof(ev.payload));
+						len = 0;
+						ev.payload_truncated = true;
+					} else {
+						ev.payload_truncated =
+							tr->data_size >
+							HK_BINDER_MAX_PAYLOAD;
+					}
+				} else if (copy_from_user(ev.payload,
 						   (const void __user *)(uintptr_t)tr->data.ptr.buffer,
 						   len)) {
 					memset(ev.payload, 0,
@@ -271,6 +284,7 @@ void hk_binder_exit(void)
 	hk_inline_free(&g_binder.transaction);
 	hk_inline_free(&g_binder.copy);
 	hk_inline_free(&g_binder.ioctl);
+	hk_cfi_exit();
 
 	memset(&g_binder, 0, sizeof(g_binder));
 	pr_info("[lkmhook] binder trace exit\n");

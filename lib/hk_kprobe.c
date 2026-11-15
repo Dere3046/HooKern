@@ -466,15 +466,27 @@ void hk_kprobe_exit(void)
 
 	list_for_each_entry_safe(node, tmp, &pending, list) {
 		if (hk_kprobe_drop(node->hook))
-			g_kprobe_stuck++;
+			continue;
 		list_del(&node->list);
 		kfree(node);
 	}
+
+	spin_lock_irqsave(&g_kprobe_lock, flags);
+	list_splice_tail(&pending, &g_kprobes);
+	spin_unlock_irqrestore(&g_kprobe_lock, flags);
 
 	hk_kprobe_restore_blacklist();
 }
 
 unsigned int hk_kprobe_pending(void)
 {
-	return READ_ONCE(g_kprobe_stuck);
+	unsigned int count = 0;
+	struct hk_kprobe_node *node;
+	unsigned long flags;
+
+	spin_lock_irqsave(&g_kprobe_lock, flags);
+	list_for_each_entry(node, &g_kprobes, list)
+		count++;
+	spin_unlock_irqrestore(&g_kprobe_lock, flags);
+	return count;
 }
