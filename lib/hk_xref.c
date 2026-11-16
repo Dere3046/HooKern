@@ -171,6 +171,7 @@ int hk_probe_call_site(struct hk_call_site *site)
 	size_t size_words;
 	size_t i;
 	unsigned int effective_hops;
+	u32 first_insn;
 	u32 insn;
 	bool ret_seen;
 	bool has_explicit_bound;
@@ -238,10 +239,18 @@ int hk_probe_call_site(struct hk_call_site *site)
 	if (!site->caller_size && !site->caller_end) {
 		unwrapped_caller = hk_unwrap_trampoline_depth(site->caller_addr, effective_hops);
 		if (hk_match_target(unwrapped_caller, site->callee_addr, unwrapped_callee, effective_hops)) {
+			first_insn = 0;
 			site->b_count = 1;
 			site->offsets[0] = 0;
 			site->offset_count = 1;
 			site->scanned_insns = 1;
+			if (copy_from_kernel_nofault(&first_insn,
+			    (const void *)site->caller_addr, sizeof(first_insn)) == 0) {
+				if (hk_insn_is_pad(first_insn)) {
+					site->offsets[0] = 4;
+					site->scanned_insns = 2;
+				}
+			}
 			site->state = HK_CALL_STATE_TAIL;
 			return 0;
 		}
