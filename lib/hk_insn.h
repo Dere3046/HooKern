@@ -23,6 +23,12 @@
 #define HK_INSN_RETAA			0xD65F0BFFu
 #define HK_INSN_RETAB			0xD65F0FFFu
 
+#define HK_INSN_BR_MASK			0xFFFFFC1Fu
+#define HK_INSN_BR_VAL			0xD61F0000u
+
+#define HK_INSN_BR_AUTH_MASK		0xFEFFF800u
+#define HK_INSN_BR_AUTH_VAL		0xD61F0800u
+
 #define HK_INSN_BCOND_MASK		0xFF000010u
 #define HK_INSN_BCOND_VAL		0x54000000u
 
@@ -64,6 +70,12 @@ static inline bool hk_insn_is_ret(u32 insn)
 {
 	return (insn & HK_INSN_RET_MASK) == HK_INSN_RET_VAL ||
 	       (insn & HK_INSN_RET_AUTH_MASK) == HK_INSN_RET_AUTH_VAL;
+}
+
+static inline bool hk_insn_is_br(u32 insn)
+{
+	return (insn & HK_INSN_BR_MASK) == HK_INSN_BR_VAL ||
+	       (insn & HK_INSN_BR_AUTH_MASK) == HK_INSN_BR_AUTH_VAL;
 }
 
 static inline bool hk_insn_is_bcond(u32 insn)

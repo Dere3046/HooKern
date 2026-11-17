@@ -20,6 +20,7 @@
 #include <linux/vmalloc.h>
 
 #include "hk.h"
+#include "hk_insn.h"
 #include "hk_patch.h"
 #include "hk_inline.h"
 
@@ -811,12 +812,10 @@ static int hk_inline_short(const u32 *win, unsigned int words)
 	unsigned int i;
 
 	for (i = 0; i < words; i++) {
-		bool ret = (win[i] & 0xFFFFFC1F) == 0xD65F0000;
-		bool br = (win[i] & 0xFFFFFC1F) == 0xD61F0000;
-		bool b = (win[i] & 0xFC000000) == 0x14000000;
-
-		if ((ret || br || b) && i + 1 < words)
+		if ((hk_insn_is_ret(win[i]) || hk_insn_is_br(win[i]) ||
+		     hk_insn_is_b(win[i])) && i + 1 < words) {
 			return -EOPNOTSUPP;
+		}
 	}
 	return 0;
 }
@@ -1346,7 +1345,7 @@ static __nocfi int hk_follow_branch(unsigned long addr, unsigned long *out)
 
 static __nocfi bool hk_is_br(u32 insn)
 {
-	return (insn & HK_INS_BR_MASK) == HK_INS_BR_ANY;
+	return hk_insn_is_br(insn);
 }
 
 static __nocfi bool hk_is_brk(u32 insn)
