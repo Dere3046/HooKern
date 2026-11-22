@@ -33,9 +33,6 @@ struct hk_kprobe_node {
 static LIST_HEAD(g_kprobes);
 static DEFINE_SPINLOCK(g_kprobe_lock);
 
-/* a probe that unregister_kprobe cannot take back keeps reaching into this module */
-static unsigned int g_kprobe_stuck;
-
 struct hk_blacklist_saved {
 	struct kprobe_blacklist_entry *entry;
 	unsigned long start_addr;

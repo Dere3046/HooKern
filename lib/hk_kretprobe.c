@@ -28,9 +28,6 @@ struct hk_kretprobe_node {
 static LIST_HEAD(g_kretprobes);
 static DEFINE_SPINLOCK(g_kretprobe_lock);
 
-/* a probe the sweep cannot take back keeps reaching into this module */
-static unsigned int g_kretprobe_stuck;
-
 static __nocfi int call_register_kretprobe(struct kretprobe *rp)
 {
 	register_kretprobe_fn fn;
