@@ -165,11 +165,13 @@ pte_of the way it finds that entry, a null one being the library's own walk.
 *w, int (*fn)(void *ctx, void *addr, size_t len), void *ctx)** runs that window and
 lets the caller store its own way, once per page over the range.
 
-a hook that lands on a guarded page records what it had to do in
-`struct hk_inline.use_br_x17`: true means the jump back goes through `br x17` with
-the guarded bit taken off the page, false means it fell back to `ret x17`, which
-needs no landing pad at all. the library keeps the state and writes no log of its
-own, so a project that wants one reads the field after the hook is installed.
+how relocated branches and the continuation jump back to target text is the
+caller's choice through `ret_mode`: zero or `HK_INLINE_RET_X17` emits `ret x17`
+and leaves kernel page tables untouched, `HK_INLINE_BR_GUARD` clears the guarded
+bit on single 4k entries and falls back to `ret x17` on block or contiguous
+entries that hardware caches as one block, and `HK_INLINE_BR_X17` emits `br x17`
+directly. the library keeps no log of its own, so a caller that wants to know
+which form landed reads `struct hk_inline.use_br_x17`.
 
 **int hk_write_run(void *dst, const void *src, size_t len, const struct hk_write
 *w)** is the same write with every mechanism named by the caller: the translation
@@ -315,6 +317,24 @@ the library passes in x17, and the preset decide stub is library asm,
 so a consumer only supplies the callback. hk_inline_hook is the
 wrapper_sym shorthand of the same path.
 
+```c
+enum hk_inline_ret_mode {
+	HK_INLINE_RET_DEFAULT = 0,
+	HK_INLINE_RET_X17,
+	HK_INLINE_BR_GUARD,
+	HK_INLINE_BR_X17,
+};
+
+struct hk_inline_ops {
+	const char *sym;
+	const char *wrapper_sym;
+	const char *stub_sym;
+	int (*decide)(struct hk_inline_regs *regs, void *arg);
+	void *arg;
+	enum hk_inline_ret_mode ret_mode;
+};
+```
+
 installs are serialized by a mutex held across trampoline allocation,
 relocation and the text writes, so two hooks cannot interleave and a
 restore cannot run inside an install. the write itself is still not
@@ -360,16 +380,19 @@ struct hk_inline {
 	struct hk_inline_guard guard[HK_INLINE_GUARD_MAX];
 	u32 guard_count;
 	u8 saved[HK_INLINE_ENTRY_MAX * 4];
+	struct hk_inline_ctx ctx;
+	enum hk_inline_ret_mode ret_mode;
 };
 ```
 
-the continuation after the patched window is reached with an indirect
-branch, so the pages that hold one and carry the guarded attribute have
-it cleared for the install and put back when the trampoline is freed,
-recorded in `guard` and counted by `guard_count`. when the attribute
-cannot be cleared the continuation uses `RET X17` instead of `BR X17`,
-which is a return and needs no landing pad, and `use_br_x17` reports
-which of the two is in the trampoline.
+`ret_mode` on `struct hk_inline_ops` or `struct hk_inline` is read before the
+install, `ops` wins when both are set. `HK_INLINE_RET_DEFAULT` and
+`HK_INLINE_RET_X17` emit `ret x17` so target text needs no landing pad and kernel
+ptes stay untouched. `HK_INLINE_BR_GUARD` clears the guarded bit on pages it can
+own alone (recorded in `guard` and `guard_count`), refuses contiguous `PTE_CONT`
+or block entries because hardware caches them as a larger translation, and falls
+back to `ret x17` there. `HK_INLINE_BR_X17` emits `br x17` without touching ptes.
+`use_br_x17` reports what the continuation actually carries.
 
 **int hk_inline_disable(struct hk_inline *h)**
 
@@ -684,8 +707,19 @@ struct hk_redir {
 		struct hk_inline text;
 		struct hk_kprobe kprobe;
 	} u;
+	hk_probe_adjust_fn adjust;
+	void *adjust_arg;
+	enum hk_inline_ret_mode ret_mode;
 };
 ```
+
+`adjust` and `adjust_arg` are read before the install on `HK_REDIR_KPROBE`: a
+null rule keeps the plain entry address, and a caller that hooks a padded or
+pac entry via indirect calls passes `hk_kprobe_adjust_pad` or a rule of its
+own so the breakpoint sits past the landing pad while `orig` keeps the entry.
+`HK_REDIR_GUARD_CALLER` strips pac from `x30` before testing whether the caller
+came from this module. `ret_mode` is read before the install on `HK_REDIR_TEXT`
+and selects the inline jump back rule.
 
 **int hk_redir_install(struct hk_redir *r, const char *sym, const char *repl_sym, enum hk_redir_how how)**
 

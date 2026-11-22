@@ -112,6 +112,9 @@ struct hk_redir {
 		struct hk_inline text;
 		struct hk_kprobe kprobe;
 	} u;
+	hk_probe_adjust_fn adjust;		/* kprobe route landing rule read before install */
+	void *adjust_arg;			/* passed to adjust */
+	enum hk_inline_ret_mode ret_mode;	/* text route continuation read before install */
 };
 
 /*

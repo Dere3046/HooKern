@@ -104,7 +104,7 @@ static int hk_redir_pre(struct kprobe *p, struct pt_regs *regs)
 		 * lives in is the replacement reaching for the original, which is what
 		 * the original instruction has to run for
 		 */
-		if (within_module(regs->regs[30], THIS_MODULE)) {
+		if (within_module(hk_pac_strip(regs->regs[30]), THIS_MODULE)) {
 			if (pinned)
 				hk_redir_put_ref();
 			return 0;
@@ -173,6 +173,8 @@ int hk_redir_install_at(struct hk_redir *r, unsigned long addr,
 			unsigned long repl, enum hk_redir_how how)
 {
 	enum hk_redir_guard guard;
+	hk_probe_adjust_fn adjust;
+	void *adjust_arg;
 	bool pin;
 	int ret;
 
@@ -187,11 +189,15 @@ int hk_redir_install_at(struct hk_redir *r, unsigned long addr,
 	/* what the caller named before the call, everything else is set here */
 	pin = r->pin;
 	guard = r->guard;
+	adjust = r->adjust;
+	adjust_arg = r->adjust_arg;
 
 	memset(r, 0, sizeof(*r));
 	r->how = how;
 	r->guard = guard;
 	r->pin = pin;
+	r->adjust = adjust;
+	r->adjust_arg = adjust_arg;
 	r->addr = addr;
 	r->orig = addr;
 	r->repl = repl;
@@ -220,6 +226,8 @@ int hk_redir_install_at(struct hk_redir *r, unsigned long addr,
 	 * register_kprobe returns, and the handler has to see a hook it may enter
 	 */
 	r->live = true;
+	r->u.kprobe.adjust = adjust;
+	r->u.kprobe.arg = adjust_arg;
 	ret = hk_kprobe_install_at(&r->u.kprobe, addr, hk_redir_pre);
 	if (ret) {
 		r->live = false;
@@ -246,16 +254,22 @@ int hk_redir_install(struct hk_redir *r, const char *sym, const char *repl_sym,
 		/* the entry writer is not part of this build, so there is no text route */
 		return -EOPNOTSUPP;
 #else
+		enum hk_inline_ret_mode ret_mode = r->ret_mode;
+
 		/* neither of the two is a mechanism the entry writer has */
 		if (r->pin || r->guard != HK_REDIR_GUARD_TASK)
 			return -EOPNOTSUPP;
+		if (ret_mode < HK_INLINE_RET_DEFAULT || ret_mode > HK_INLINE_BR_X17)
+			return -EINVAL;
 
 		memset(r, 0, sizeof(*r));
 		r->how = how;
+		r->ret_mode = ret_mode;
 		r->name = sym;
 		r->repl = hk_resolve(repl_sym);
 		if (!r->repl)
 			return -ENOENT;
+		r->u.text.ret_mode = ret_mode;
 		ret = hk_inline_hook(&r->u.text, sym, repl_sym);
 		if (ret)
 			return ret;

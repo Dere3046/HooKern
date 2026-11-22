@@ -5,6 +5,7 @@
 
 #include <linux/errno.h>
 #include <linux/list.h>
+#include <asm/pgtable.h>
 #include <asm/tlbflush.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -49,11 +50,6 @@
 #define HK_INS_MOVZ 0x52800000
 #define HK_INS_MOVK 0x72800000
 #define HK_INS_MOV_X9_LR 0xAA1E03E9
-
-/* bit 50 of an arm64 pte, the BTI guarded attribute of the page */
-#define HK_PTE_GP 0x0004000000000000UL
-
-#define HK_BTI_GUARDED(_pte) ((_pte) & HK_PTE_GP)
 
 /* dry run sink for the probe, the tables allow 8 words per instruction */
 #define HK_PROBE_SCRATCH 128
@@ -288,6 +284,8 @@ struct hk_relo_ctx {
 	unsigned long tramp_start;
 	unsigned long tramp_end;
 	unsigned long backup_start;
+	struct hk_inline *hook;
+	enum hk_inline_ret_mode ret_mode;
 };
 
 static __nocfi hk_inst_type_t hk_insn_type(u32 insn)
@@ -337,9 +335,8 @@ static u64 hk_relo_in_tramp(const struct hk_relo_ctx *c, u64 addr)
 }
 
 /*
- * ldr x17, #8 ; b #12 ; lo ; hi ; br x17 ; nop
- * the literal sits behind the branch so the sequence is one straight line and
- * four words is the shortest form, the nop keeps every emission the same length
+ * ldr x17 #8 b #12 lo hi br x17 or ret x17 nop
+ * ret x17 resets BTYPE so no landing pad or pte edit is needed
  */
 static __nocfi int hk_relo_stub(struct hk_relo_ctx *c, u64 addr, bool wrap)
 {
@@ -347,12 +344,27 @@ static __nocfi int hk_relo_stub(struct hk_relo_ctx *c, u64 addr, bool wrap)
 	c->dst[c->count++] = 0x14000003;
 	c->dst[c->count++] = addr & 0xFFFFFFFF;
 	c->dst[c->count++] = addr >> 32;
-	if (wrap)
-		c->dst[c->count++] = HK_INS_BR_X17;
-	else
-		c->dst[c->count++] = HK_INS_RET_X17;
+	c->dst[c->count++] = wrap ? HK_INS_BR_X17 : HK_INS_RET_X17;
 	c->dst[c->count++] = HK_INS_NOP;
 	return 0;
+}
+
+static int hk_bti_guard_track(struct hk_inline *h, unsigned long addr);
+
+static bool hk_relo_use_br(struct hk_inline *h, enum hk_inline_ret_mode mode,
+			   unsigned long addr)
+{
+	if (mode == HK_INLINE_BR_X17)
+		return true;
+	if (mode == HK_INLINE_BR_GUARD && h)
+		return hk_bti_guard_track(h, addr) == 0;
+	return false;
+}
+
+static __nocfi int hk_relo_branch(struct hk_relo_ctx *c, u64 addr)
+{
+	return hk_relo_stub(c, addr,
+			    hk_relo_use_br(c->hook, c->ret_mode, addr));
 }
 
 static __nocfi int hk_relo_abs_jump(struct hk_relo_ctx *c, u64 target)
@@ -386,7 +398,7 @@ static __nocfi int hk_relo_b(struct hk_relo_ctx *c, u32 insn,
 		c->dst[c->count++] = (insn & 0xFF00001F) | 0x40;
 		c->dst[c->count++] = 0x14000006;
 	}
-	return hk_relo_stub(c, addr, type != HK_INST_BL);
+	return hk_relo_branch(c, addr);
 }
 
 /*
@@ -500,7 +512,7 @@ static __nocfi int hk_relo_cb(struct hk_relo_ctx *c, u32 insn)
 	addr = hk_relo_in_tramp(c, addr);
 	c->dst[c->count++] = (insn & 0xFF00001F) | 0x40;
 	c->dst[c->count++] = 0x14000006;
-	return hk_relo_stub(c, addr, true);
+	return hk_relo_branch(c, addr);
 }
 
 static __nocfi int hk_relo_tb(struct hk_relo_ctx *c, u32 insn)
@@ -510,7 +522,7 @@ static __nocfi int hk_relo_tb(struct hk_relo_ctx *c, u32 insn)
 	addr = hk_relo_in_tramp(c, addr);
 	c->dst[c->count++] = (insn & 0xFFF8001F) | 0x40;
 	c->dst[c->count++] = 0x14000006;
-	return hk_relo_stub(c, addr, true);
+	return hk_relo_branch(c, addr);
 }
 
 static __nocfi int hk_relo_inst(struct hk_relo_ctx *c, u32 insn)
@@ -767,13 +779,6 @@ static int hk_inline_collide(const char *sym, unsigned long start, u32 len,
 	return -EBUSY;
 }
 
-/*
- * the page table entry of a kernel virtual address. the walk is the generic one
- * and it is handed the kernel's own init_mm, resolved at runtime because the
- * symbol is not in the module namespace of every build. a block mapping at any
- * level means the page has no pte this code could change, which is a refused
- * guard rather than a written entry
- */
 static unsigned long *hk_pte_of(unsigned long addr)
 {
 	struct mm_struct *mm;
@@ -820,16 +825,6 @@ static int hk_inline_short(const u32 *win, unsigned int words)
 	return 0;
 }
 
-
-/*
- * the continuation of every relocated branch is an indirect branch, and an
- * indirect branch into a page whose pte carries the guarded attribute traps
- * unless the first instruction is a bti landing pad. the resumption points are
- * the instructions after the patched window, which are not landing pads, so the
- * attribute is cleared for exactly the pages that hold one and recorded for the
- * free path to put back. the attribute is not cleared on the entry page, a
- * caller that reaches the entry indirectly needs the landing pad there
- */
 static int hk_bti_guard_track(struct hk_inline *h, unsigned long addr)
 {
 	struct hk_inline_guard *guard;
@@ -848,8 +843,11 @@ static int hk_bti_guard_track(struct hk_inline *h, unsigned long addr)
 	if (!ptep)
 		return -EFAULT;
 	pte = READ_ONCE(*ptep);
-	if (!HK_BTI_GUARDED(pte))
+	if (!(pte & PTE_GP))
 		return 0;
+	/* live contiguous mappings cannot drop GP on a single 4KB entry safely */
+	if (pte & PTE_CONT)
+		return -EOPNOTSUPP;
 
 	guard = &h->guard[h->guard_count++];
 	guard->page = page;
@@ -862,11 +860,11 @@ static int hk_bti_guard_track(struct hk_inline *h, unsigned long addr)
 	 * enough: without the invalidation a cpu keeps the old translation and the
 	 * branch back into the middle of the function still trips BTI
 	 */
-	WRITE_ONCE(*ptep, pte & ~HK_PTE_GP);
+	WRITE_ONCE(*ptep, pte & ~PTE_GP);
 	__flush_tlb_kernel_pgtable(page);
 	dsb(ish);
 	isb();
-	if (READ_ONCE(*ptep) & HK_PTE_GP) {
+	if (READ_ONCE(*ptep) & PTE_GP) {
 		/* the bit cannot be taken away here, so the hook must not be set up */
 		WRITE_ONCE(*ptep, pte);
 		__flush_tlb_kernel_pgtable(page);
@@ -902,6 +900,7 @@ static void hk_bti_guard_restore(struct hk_inline *h)
 static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 				   unsigned long target, unsigned long addr,
 				   bool detect_pac,
+				   enum hk_inline_ret_mode ret_mode,
 				   const struct hk_inline_ctx *in)
 {
 	struct hk_relo_ctx ctx;
@@ -913,6 +912,7 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	int ret;
 
 	memset(h, 0, sizeof(*h));
+	h->ret_mode = ret_mode;
 	if (in)
 		h->ctx = *in;
 	tramp = kzalloc(256, GFP_KERNEL);
@@ -1009,6 +1009,8 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	ctx.tramp_end = addr + HK_INLINE_PATCH_LEN;
 	ctx.backup_start = mem + (in ? HK_INLINE_CTX_BYTES :
 				   HK_INLINE_WRAP_BYTES);
+	ctx.hook = h;
+	ctx.ret_mode = ret_mode;
 
 	for (i = 0; i < HK_INLINE_ENTRY_MAX; i++) {
 		ctx.inst_addr = addr + i * 4;
@@ -1020,16 +1022,8 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 		}
 	}
 
-	/*
-	 * the continuation is the instruction after the window. it is reached with
-	 * an indirect branch, so the page is guarded and the landing pad rule
-	 * applies: br x17 stays when the attribute can be cleared, otherwise ret
-	 * x17 is used, which is a return and has no landing pad requirement
-	 */
 	ctx.inst_addr = addr + HK_INLINE_PATCH_LEN;
-	h->use_br_x17 = true;
-	if (hk_bti_guard_track(h, addr + HK_INLINE_PATCH_LEN))
-		h->use_br_x17 = false;
+	h->use_br_x17 = hk_relo_use_br(h, ret_mode, addr + HK_INLINE_PATCH_LEN);
 	ret = hk_relo_stub(&ctx, addr + HK_INLINE_PATCH_LEN, h->use_br_x17);
 	if (ret)
 		goto err_guard;
@@ -1085,6 +1079,7 @@ __nocfi int hk_inline_hook_ops(struct hk_inline *h,
 			       const struct hk_inline_ops *ops)
 {
 	struct hk_inline_ctx in = { };
+	enum hk_inline_ret_mode ret_mode;
 	const char *wrapper_sym;
 	const char *stub_sym;
 	unsigned long addr = 0;
@@ -1093,6 +1088,9 @@ __nocfi int hk_inline_hook_ops(struct hk_inline *h,
 	int ret;
 
 	if (!h || !ops || !ops->sym)
+		return -EINVAL;
+	ret_mode = ops->ret_mode ? ops->ret_mode : h->ret_mode;
+	if (ret_mode < HK_INLINE_RET_DEFAULT || ret_mode > HK_INLINE_BR_X17)
 		return -EINVAL;
 	wrapper_sym = ops->wrapper_sym;
 	stub_sym = ops->stub_sym;
@@ -1132,7 +1130,7 @@ __nocfi int hk_inline_hook_ops(struct hk_inline *h,
 		return ret;
 	mutex_lock(&g_inline_lock);
 	ret = hk_inline_apply(h, ops->sym, target, addr, wrapper_sym != NULL,
-			      wrapper_sym ? NULL : &in);
+			      ret_mode, wrapper_sym ? NULL : &in);
 	mutex_unlock(&g_inline_lock);
 	if (ret)
 		hk_inline_release(h);

@@ -39,6 +39,14 @@ struct hk_inline_ctx {
 	int (*decide)(struct hk_inline_regs *regs, void *arg);
 };
 
+/* how relocated branches and the window continuation resume target text */
+enum hk_inline_ret_mode {
+	HK_INLINE_RET_DEFAULT = 0,	/* same as HK_INLINE_RET_X17 */
+	HK_INLINE_RET_X17,		/* ret x17 without modifying kernel ptes */
+	HK_INLINE_BR_GUARD,		/* clear PTE_GP when non contiguous and use br x17 */
+	HK_INLINE_BR_X17,		/* raw br x17 without modifying ptes */
+};
+
 struct hk_inline {
 	const char *name;
 	unsigned long addr;
@@ -53,6 +61,7 @@ struct hk_inline {
 	u32 guard_count;
 	u8 saved[HK_INLINE_ENTRY_MAX * 4];
 	struct hk_inline_ctx ctx;
+	enum hk_inline_ret_mode ret_mode;	/* read before the install */
 };
 
 /*
@@ -89,6 +98,7 @@ struct hk_inline_ops {
 	const char *stub_sym;
 	int (*decide)(struct hk_inline_regs *regs, void *arg);
 	void *arg;
+	enum hk_inline_ret_mode ret_mode;
 };
 
 int hk_inline_hook_ops(struct hk_inline *h, const struct hk_inline_ops *ops);
