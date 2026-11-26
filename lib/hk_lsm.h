@@ -29,13 +29,14 @@ struct hk_lsm_hook {
 	void *scall;
 	bool inserted;	/* set when the entry is ours, insert route */
 	/*
-	 * the node this library inserts when the list route is taken. it is this
-	 * library's own type because the kernel's changed shape in 6.12, and what the
-	 * list carries at its second word is the hook either way
+	 * synthetic security_hook_list node inserted when the target hlist_head
+	 * is empty on the list route. the kernel's struct layout varies across
+	 * versions (and OEM configs), so the hook pointer and optional head
+	 * back-pointer are placed at runtime-discovered offsets inside raw[]
 	 */
-	struct hk_lsm_node {
+	union {
 		struct hlist_node node;
-		void *hook;
+		u8 raw[64];
 	} ours;
 	int offset;
 };

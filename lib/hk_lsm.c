@@ -344,12 +344,32 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 							  hook_off);
 				selected_origin = *selected_slot;
 			} else {
+				size_t head_field_off = 0;
+
+				if (hook_off < sizeof(struct hlist_node) ||
+				    hook_off + sizeof(void *) >
+				    sizeof(hook->ours.raw)) {
+					ret = -EOPNOTSUPP;
+					goto out_unlock;
+				}
+				memset(hook->ours.raw, 0,
+				       sizeof(hook->ours.raw));
 				selected_entry =
 					(struct security_hook_list *)&hook->ours;
 				hook->ours.node.next = NULL;
 				hook->ours.node.pprev = &head->first;
-				hook->ours.hook = hook->replacement;
-				selected_slot = &hook->ours.hook;
+				if (!hk_lsm_off("security_hook_list", "head",
+						&head_field_off) &&
+				    head_field_off >= sizeof(struct hlist_node) &&
+				    head_field_off + sizeof(void *) <=
+				    sizeof(hook->ours.raw) &&
+				    head_field_off != hook_off) {
+					*(struct hlist_head **)
+					 (hook->ours.raw + head_field_off) = head;
+				}
+				*(void **)(hook->ours.raw + hook_off) =
+					hook->replacement;
+				selected_slot = (void **)&head->first;
 				selected_origin = NULL;
 			}
 			break;
@@ -458,10 +478,12 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 	if (ret)
 		goto out_unlock;
 
-	if (selected_origin)
+	if (selected_entry == (struct security_hook_list *)&hook->ours) {
+		smp_wmb();
+		ret = hk_lsm_patch_slot(selected_slot, &hook->ours.node);
+	} else {
 		ret = hk_lsm_patch_slot(selected_slot, hook->replacement);
-	else
-		ret = hk_lsm_patch_slot(selected_slot, &hook->ours);
+	}
 	if (ret) {
 		ret = -EFAULT;
 		goto out_untrack;
@@ -642,6 +664,7 @@ static void hk_lsm_unhook_locked(struct hk_lsm_hook *hook)
 {
 	size_t hook_off;
 	void **slot;
+	void *restore;
 	size_t scall_key_off = 0;
 	size_t scall_tramp_off = 0;
 
@@ -659,15 +682,23 @@ static void hk_lsm_unhook_locked(struct hk_lsm_hook *hook)
 	if (!hook->entry) {
 		return;
 	}
+	restore = hook->original;
 	/* a hook that went in through a static call says so with this field */
 	if (hook->scall)
 		slot = (void **)((char *)hook->entry + hook_off);
-	else if (hook->entry == (struct security_hook_list *)&hook->ours)
-		slot = (void **)&hook->ours.node.pprev;
-	else
+	else if (hook->entry == (struct security_hook_list *)&hook->ours) {
+		slot = (void **)hook->ours.node.pprev;
+		restore = hook->ours.node.next;
+	} else
 		slot = (void **)((char *)hook->entry + hook_off);
 
-	if (hk_lsm_patch_slot(slot, hook->original)) {
+	if (!slot) {
+		pr_warn("[lkmhook] lsm restore missing slot %s\n",
+			hook->head_name ?: "unknown");
+		return;
+	}
+
+	if (hk_lsm_patch_slot(slot, restore)) {
 		pr_warn("[lkmhook] lsm restore failed %s\n",
 			hook->head_name ?: "unknown");
 		return;
