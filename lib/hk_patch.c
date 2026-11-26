@@ -14,6 +14,7 @@
 #include <linux/mutex.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/stop_machine.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
@@ -167,6 +168,7 @@ static clean_inval_fn g_clean_inval;
 static fixmap_fn g_set_fixmap;
 static insn_write_fn g_insn_write;
 static insn_patch_fn g_insn_patch;
+static raw_spinlock_t *g_kern_patch_lock;
 static unsigned long g_image_start;
 static unsigned long g_image_end;
 static bool g_image_read;
@@ -217,6 +219,10 @@ void hk_patch_init(void)
 	fn = hk_resolve("copy_to_kernel_nofault");
 	if (fn && hk_ker_addr_ok(fn))
 		g_nofault_write = (nofault_write_fn)fn;
+
+	fn = hk_resolve("patch_lock");
+	if (fn && hk_ker_addr_ok(fn))
+		g_kern_patch_lock = (raw_spinlock_t *)fn;
 
 	pr_info("[lkmhook] patch symbols ready, %d optional missing\n", missing);
 }
@@ -829,19 +835,61 @@ static unsigned long (*hk_write_to_pa(const struct hk_write *w))(unsigned long)
 /*
  * the kernel's own poke slot, the same one its patcher maps through, so a platform
  * that watches fixmap use sees what it expects. the target's own page is left
- * alone: this is a mapping made here and it is writable whatever the target says
+ * alone: this is a mapping made here and it is writable whatever the target says.
+ * FIX_TEXT_POKE0 is shared with arch/arm64/kernel/patching.c, so every map/write/
+ * unmap sequence takes the kernel's patch_lock with IRQs disabled
  */
 static int hk_poke_run(struct hk_patch_job *job, const struct hk_write *w)
 {
 	unsigned long addr = job->addr;
 	const void *src = job->src;
 	size_t left = job->len;
+	unsigned long fn;
 	int ret = 0;
 
 	lockdep_assert_held(&g_patch_lock);
+	if (!g_kern_patch_lock) {
+		fn = hk_resolve("patch_lock");
+		if (fn && hk_ker_addr_ok(fn))
+			g_kern_patch_lock = (raw_spinlock_t *)fn;
+	}
+	if (!g_kern_patch_lock) {
+		pr_warn("[lkmhook] patch_lock not found, FIX_TEXT_POKE0 refused\n");
+		return -ENOENT;
+	}
+	/* resolve helpers before entering the raw spinlock section */
+	if (!g_set_fixmap) {
+		fn = hk_resolve("__set_fixmap");
+		if (fn && hk_ker_addr_ok(fn))
+			g_set_fixmap = (fixmap_fn)fn;
+	}
+	if (!g_set_fixmap) {
+		pr_warn("[lkmhook] __set_fixmap not found, the write is refused\n");
+		return -ENOENT;
+	}
+	if (!g_clean_inval) {
+		fn = hk_resolve("caches_clean_inval_pou");
+		if (!fn)
+			fn = hk_resolve("dcache_clean_inval_poc");
+		if (!fn)
+			fn = hk_resolve("__flush_icache_range");
+		if (fn && hk_ker_addr_ok(fn))
+			g_clean_inval = (clean_inval_fn)fn;
+	}
+	if (!g_clean_inval) {
+		pr_warn("[lkmhook] no cache clean fn, the write is refused\n");
+		return -ENOENT;
+	}
+	if (w->nofault && !g_nofault_write) {
+		fn = hk_resolve("copy_to_kernel_nofault");
+		if (fn && hk_ker_addr_ok(fn))
+			g_nofault_write = (nofault_write_fn)fn;
+	}
+
 	cpus_read_lock();
 	while (left) {
 		unsigned long phys = hk_write_to_pa(w)(addr);
+		unsigned long flags;
 		size_t chunk;
 		void *map;
 
@@ -850,20 +898,23 @@ static int hk_poke_run(struct hk_patch_job *job, const struct hk_write *w)
 			break;
 		}
 		chunk = min(left, PAGE_SIZE - (phys & ~PAGE_MASK));
+		raw_spin_lock_irqsave(g_kern_patch_lock, flags);
 		ret = call_set_fixmap(FIX_TEXT_POKE0, phys & PAGE_MASK,
 				      PAGE_KERNEL);
-		if (ret)
-			break;
-		map = (void *)(__fix_to_virt(FIX_TEXT_POKE0) + (phys & ~PAGE_MASK));
-		if (w->nofault)
-			ret = (int)call_nofault_write(map, src, chunk);
-		else {
-			memcpy(map, src, chunk);
-			dsb(ish);
+		if (!ret) {
+			map = (void *)(__fix_to_virt(FIX_TEXT_POKE0) +
+				       (phys & ~PAGE_MASK));
+			if (w->nofault)
+				ret = (int)call_nofault_write(map, src, chunk);
+			else {
+				memcpy(map, src, chunk);
+				dsb(ish);
+			}
+			call_set_fixmap(FIX_TEXT_POKE0, 0, __pgprot(0));
 		}
+		raw_spin_unlock_irqrestore(g_kern_patch_lock, flags);
 		if (!ret)
 			ret = call_clean_inval(addr, addr + chunk);
-		call_set_fixmap(FIX_TEXT_POKE0, 0, __pgprot(0));
 		if (ret)
 			break;
 		addr += chunk;
