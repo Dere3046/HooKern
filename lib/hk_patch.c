@@ -173,6 +173,18 @@ static unsigned long g_image_start;
 static unsigned long g_image_end;
 static bool g_image_read;
 
+static raw_spinlock_t *hk_patch_lock_ptr(void)
+{
+	unsigned long fn;
+
+	if (g_kern_patch_lock)
+		return g_kern_patch_lock;
+	fn = hk_resolve("patch_lock");
+	if (fn && hk_ker_addr_ok(fn) && !hk_core_text(fn))
+		g_kern_patch_lock = (raw_spinlock_t *)fn;
+	return g_kern_patch_lock;
+}
+
 void hk_patch_init(void)
 {
 	unsigned long fn;
@@ -220,9 +232,7 @@ void hk_patch_init(void)
 	if (fn && hk_ker_addr_ok(fn))
 		g_nofault_write = (nofault_write_fn)fn;
 
-	fn = hk_resolve("patch_lock");
-	if (fn && hk_ker_addr_ok(fn))
-		g_kern_patch_lock = (raw_spinlock_t *)fn;
+	hk_patch_lock_ptr();
 
 	pr_info("[lkmhook] patch symbols ready, %d optional missing\n", missing);
 }
@@ -832,28 +842,11 @@ static unsigned long (*hk_write_to_pa(const struct hk_write *w))(unsigned long)
 	return hk_va_walk_pa;
 }
 
-/*
- * the kernel's own poke slot, the same one its patcher maps through, so a platform
- * that watches fixmap use sees what it expects. the target's own page is left
- * alone: this is a mapping made here and it is writable whatever the target says.
- * FIX_TEXT_POKE0 is shared with arch/arm64/kernel/patching.c, so every map/write/
- * unmap sequence takes the kernel's patch_lock with IRQs disabled
- */
-static int hk_poke_run(struct hk_patch_job *job, const struct hk_write *w)
+static int hk_poke_syms_ready(const struct hk_write *w)
 {
-	unsigned long addr = job->addr;
-	const void *src = job->src;
-	size_t left = job->len;
 	unsigned long fn;
-	int ret = 0;
 
-	lockdep_assert_held(&g_patch_lock);
-	if (!g_kern_patch_lock) {
-		fn = hk_resolve("patch_lock");
-		if (fn && hk_ker_addr_ok(fn))
-			g_kern_patch_lock = (raw_spinlock_t *)fn;
-	}
-	if (!g_kern_patch_lock) {
+	if (!hk_patch_lock_ptr()) {
 		pr_warn("[lkmhook] patch_lock not found, FIX_TEXT_POKE0 refused\n");
 		return -ENOENT;
 	}
@@ -880,11 +873,38 @@ static int hk_poke_run(struct hk_patch_job *job, const struct hk_write *w)
 		pr_warn("[lkmhook] no cache clean fn, the write is refused\n");
 		return -ENOENT;
 	}
-	if (w->nofault && !g_nofault_write) {
-		fn = hk_resolve("copy_to_kernel_nofault");
-		if (fn && hk_ker_addr_ok(fn))
-			g_nofault_write = (nofault_write_fn)fn;
+	if (w->nofault) {
+		if (!g_nofault_write) {
+			fn = hk_resolve("copy_to_kernel_nofault");
+			if (fn && hk_ker_addr_ok(fn))
+				g_nofault_write = (nofault_write_fn)fn;
+		}
+		if (!g_nofault_write) {
+			pr_warn("[lkmhook] copy_to_kernel_nofault not found, the write is refused\n");
+			return -EOPNOTSUPP;
+		}
 	}
+	return 0;
+}
+
+/*
+ * the kernel's own poke slot, the same one its patcher maps through, so a platform
+ * that watches fixmap use sees what it expects. the target's own page is left
+ * alone: this is a mapping made here and it is writable whatever the target says.
+ * FIX_TEXT_POKE0 is shared with arch/arm64/kernel/patching.c, so every map,
+ * write and unmap sequence takes the kernel's patch_lock with IRQs disabled
+ */
+static int hk_poke_run(struct hk_patch_job *job, const struct hk_write *w)
+{
+	unsigned long addr = job->addr;
+	const void *src = job->src;
+	size_t left = job->len;
+	int ret;
+
+	lockdep_assert_held(&g_patch_lock);
+	ret = hk_poke_syms_ready(w);
+	if (ret)
+		return ret;
 
 	cpus_read_lock();
 	while (left) {
