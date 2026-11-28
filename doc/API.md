@@ -177,7 +177,8 @@ which form landed reads `struct hk_inline.use_br_x17`.
 *w)** is the same write with every mechanism named by the caller: the translation
 (hk_va_walk_pa, hk_va_to_pa, or one of its own, a null one meaning the library's
 walk), the slot (HK_SLOT_LIBRARY, the library's own, or HK_SLOT_KERNEL, the one the
-kernel's patcher maps through), whether a store that cannot land is an error, and
+kernel's patcher maps through, serialized under the kernel's patch_lock and
+returning -ENOENT when absent), whether a store that cannot land is an error, and
 whether the target is read back afterwards. a zeroed descriptor is the library's own
 route with no read back. **int hk_write_poke(...)** is the kernel slot with the
 fault tolerant store and the read back, which is the route a platform that watches
