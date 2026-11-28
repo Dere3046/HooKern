@@ -30,9 +30,8 @@ struct hk_lsm_hook {
 	bool inserted;	/* set when the entry is ours, insert route */
 	/*
 	 * synthetic security_hook_list node inserted when the target hlist_head
-	 * is empty on the list route. the kernel's struct layout varies across
-	 * versions (and OEM configs), so the hook pointer and optional head
-	 * back-pointer are placed at runtime-discovered offsets inside raw[]
+	 * is empty on the list route. the kernel struct layout varies across
+	 * versions, so hook, head and lsm sit at runtime offsets inside raw
 	 */
 	union {
 		struct hlist_node node;

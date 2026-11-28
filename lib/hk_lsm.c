@@ -98,6 +98,53 @@ static bool hk_lsm_is_tracked(struct hk_lsm_hook *hook)
 	return false;
 }
 
+static bool hk_lsm_owns_node(const struct hlist_node *node)
+{
+	struct hk_lsm_track *track;
+
+	list_for_each_entry(track, &hk_lsm_tracked, list) {
+		if (&track->hook->ours.node == node)
+			return true;
+	}
+	return false;
+}
+
+static int hk_lsm_build_ours(struct hk_lsm_hook *hook, struct hlist_head *head,
+			     size_t hook_off)
+{
+	size_t head_field_off = 0;
+	size_t lsm_field_off = 0;
+	bool has_head = false;
+
+	if (hook_off < sizeof(struct hlist_node) ||
+	    (hook_off & (sizeof(void *) - 1)) ||
+	    hook_off + sizeof(void *) > sizeof(hook->ours.raw))
+		return -EOPNOTSUPP;
+
+	memset(hook->ours.raw, 0, sizeof(hook->ours.raw));
+	hook->ours.node.next = NULL;
+	hook->ours.node.pprev = &head->first;
+
+	if (!hk_lsm_off("security_hook_list", "head", &head_field_off) &&
+	    head_field_off >= sizeof(struct hlist_node) &&
+	    !(head_field_off & (sizeof(void *) - 1)) &&
+	    head_field_off + sizeof(void *) <= sizeof(hook->ours.raw) &&
+	    head_field_off != hook_off) {
+		*(struct hlist_head **)(hook->ours.raw + head_field_off) = head;
+		has_head = true;
+	}
+	if (!hk_lsm_off("security_hook_list", "lsm", &lsm_field_off) &&
+	    lsm_field_off >= sizeof(struct hlist_node) &&
+	    !(lsm_field_off & (sizeof(void *) - 1)) &&
+	    lsm_field_off + sizeof(void *) <= sizeof(hook->ours.raw) &&
+	    lsm_field_off != hook_off &&
+	    (!has_head || lsm_field_off != head_field_off))
+		*(const char **)(hook->ours.raw + lsm_field_off) = "lkmhook";
+
+	*(void **)(hook->ours.raw + hook_off) = hook->replacement;
+	return 0;
+}
+
 /* a node per live hook, the list has no ceiling */
 static int hk_lsm_track(struct hk_lsm_hook *hook)
 {
@@ -344,31 +391,11 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 							  hook_off);
 				selected_origin = *selected_slot;
 			} else {
-				size_t head_field_off = 0;
-
-				if (hook_off < sizeof(struct hlist_node) ||
-				    hook_off + sizeof(void *) >
-				    sizeof(hook->ours.raw)) {
-					ret = -EOPNOTSUPP;
+				ret = hk_lsm_build_ours(hook, head, hook_off);
+				if (ret)
 					goto out_unlock;
-				}
-				memset(hook->ours.raw, 0,
-				       sizeof(hook->ours.raw));
 				selected_entry =
 					(struct security_hook_list *)&hook->ours;
-				hook->ours.node.next = NULL;
-				hook->ours.node.pprev = &head->first;
-				if (!hk_lsm_off("security_hook_list", "head",
-						&head_field_off) &&
-				    head_field_off >= sizeof(struct hlist_node) &&
-				    head_field_off + sizeof(void *) <=
-				    sizeof(hook->ours.raw) &&
-				    head_field_off != hook_off) {
-					*(struct hlist_head **)
-					 (hook->ours.raw + head_field_off) = head;
-				}
-				*(void **)(hook->ours.raw + hook_off) =
-					hook->replacement;
 				selected_slot = (void **)&head->first;
 				selected_origin = NULL;
 			}
@@ -376,6 +403,11 @@ int hk_lsm_hook(struct hk_lsm_hook *hook)
 		}
 		if (!selected_entry) {
 			ret = -ENOENT;
+			goto out_unlock;
+		}
+		if (selected_entry != (struct security_hook_list *)&hook->ours &&
+		    hk_lsm_owns_node((const struct hlist_node *)selected_entry)) {
+			ret = -EEXIST;
 			goto out_unlock;
 		}
 	} else {
@@ -665,6 +697,7 @@ static void hk_lsm_unhook_locked(struct hk_lsm_hook *hook)
 	size_t hook_off;
 	void **slot;
 	void *restore;
+	bool is_ours;
 	size_t scall_key_off = 0;
 	size_t scall_tramp_off = 0;
 
@@ -682,15 +715,17 @@ static void hk_lsm_unhook_locked(struct hk_lsm_hook *hook)
 	if (!hook->entry) {
 		return;
 	}
+	is_ours = hook->entry == (struct security_hook_list *)&hook->ours;
 	restore = hook->original;
 	/* a hook that went in through a static call says so with this field */
 	if (hook->scall)
 		slot = (void **)((char *)hook->entry + hook_off);
-	else if (hook->entry == (struct security_hook_list *)&hook->ours) {
+	else if (is_ours) {
 		slot = (void **)hook->ours.node.pprev;
 		restore = hook->ours.node.next;
-	} else
+	} else {
 		slot = (void **)((char *)hook->entry + hook_off);
+	}
 
 	if (!slot) {
 		pr_warn("[lkmhook] lsm restore missing slot %s\n",
@@ -704,6 +739,18 @@ static void hk_lsm_unhook_locked(struct hk_lsm_hook *hook)
 		return;
 	}
 
+	if (is_ours && restore) {
+		struct hlist_node *next = (struct hlist_node *)restore;
+
+		if (hk_lsm_patch_slot((void **)&next->pprev,
+				      hook->ours.node.pprev)) {
+			hk_lsm_patch_slot(slot, &hook->ours.node);
+			pr_warn("[lkmhook] lsm restore failed %s\n",
+				hook->head_name ?: "unknown");
+			return;
+		}
+	}
+
 	if (hook->scall &&
 	    hk_lsm_update_scall(hook->scall, scall_key_off, scall_tramp_off,
 				hook->original)) {
@@ -712,6 +759,10 @@ static void hk_lsm_unhook_locked(struct hk_lsm_hook *hook)
 	}
 
 	synchronize_rcu();
+	if (is_ours) {
+		hook->ours.node.next = NULL;
+		hook->ours.node.pprev = NULL;
+	}
 	hk_lsm_untrack(hook);
 	hook->entry = NULL;
 	hook->scall = NULL;
